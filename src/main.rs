@@ -1549,7 +1549,13 @@ fn handle_connection(mut stream: TcpStream, config: &Config) -> io::Result<()> {
 
     if metadata.is_dir() {
         log_request(&peer, &request, "200");
-        return serve_directory(&mut stream, &config.root, &path, config.port(), request.method == "HEAD");
+        return serve_directory(
+            &mut stream,
+            &config.root,
+            &path,
+            config.port(),
+            request.method == "HEAD",
+        );
     }
 
     if metadata.is_file() {
@@ -2176,7 +2182,6 @@ fn handle_folder_route(
     write_redirect_with_cookie(stream, &new_path, PIN_COOKIE, &write_pin)
 }
 
-
 fn handle_remote_route(
     stream: &mut TcpStream,
     config: &Config,
@@ -2212,7 +2217,10 @@ fn handle_remote_route(
         return write_html_response(
             stream,
             "400 Bad Request",
-            &remote_form_html(&parent_path, Some("Name, remote URL, and remote path are required.")),
+            &remote_form_html(
+                &parent_path,
+                Some("Name, remote URL, and remote path are required."),
+            ),
             &[],
             false,
         );
@@ -2222,7 +2230,10 @@ fn handle_remote_route(
         return write_html_response(
             stream,
             "400 Bad Request",
-            &remote_form_html(&parent_path, Some("Link name cannot contain path separators or internal Splinterparty names.")),
+            &remote_form_html(
+                &parent_path,
+                Some("Link name cannot contain path separators or internal Splinterparty names."),
+            ),
             &[],
             false,
         );
@@ -2232,7 +2243,10 @@ fn handle_remote_route(
         return write_html_response(
             stream,
             "400 Bad Request",
-            &remote_form_html(&parent_path, Some("Remote URL must start with http:// or https://.")),
+            &remote_form_html(
+                &parent_path,
+                Some("Remote URL must start with http:// or https://."),
+            ),
             &[],
             false,
         );
@@ -2242,7 +2256,10 @@ fn handle_remote_route(
         return write_html_response(
             stream,
             "400 Bad Request",
-            &remote_form_html(&parent_path, Some("Remote path must start with / and cannot contain '..'.")),
+            &remote_form_html(
+                &parent_path,
+                Some("Remote path must start with / and cannot contain '..'."),
+            ),
             &[],
             false,
         );
@@ -2265,12 +2282,17 @@ fn handle_remote_route(
     };
 
     let parent_metadata = fs::metadata(&parent)?;
-    if let Some((_share_dir, share)) = find_applicable_share(&config.root, &parent, &parent_metadata)? {
+    if let Some((_share_dir, share)) =
+        find_applicable_share(&config.root, &parent, &parent_metadata)?
+    {
         if !share.allows_write(parent_pin.as_deref()) {
             return write_html_response(
                 stream,
                 "403 Forbidden",
-                &remote_form_html(&parent_path, Some("The parent folder requires its read+write PIN.")),
+                &remote_form_html(
+                    &parent_path,
+                    Some("The parent folder requires its read+write PIN."),
+                ),
                 &[],
                 false,
             );
@@ -2283,7 +2305,10 @@ fn handle_remote_route(
         return write_html_response(
             stream,
             "409 Conflict",
-            &remote_form_html(&parent_path, Some("A remote link with that name already exists.")),
+            &remote_form_html(
+                &parent_path,
+                Some("A remote link with that name already exists."),
+            ),
             &[],
             false,
         );
@@ -2311,7 +2336,12 @@ fn handle_remote_route(
         );
     }
 
-    write_redirect_with_cookie(stream, &parent_path, PIN_COOKIE, parent_pin.as_deref().unwrap_or(""))
+    write_redirect_with_cookie(
+        stream,
+        &parent_path,
+        PIN_COOKIE,
+        parent_pin.as_deref().unwrap_or(""),
+    )
 }
 
 fn handle_upload_route(
@@ -2409,7 +2439,6 @@ fn handle_upload_route(
     write_redirect_with_cookie(stream, &path, PIN_COOKIE, pin.as_deref().unwrap_or(""))
 }
 
-
 fn handle_delete_route(
     stream: &mut TcpStream,
     config: &Config,
@@ -2420,7 +2449,9 @@ fn handle_delete_route(
             .query_value("path")
             .unwrap_or_else(|| "/".to_string());
         let require_pin = match delete_target(&config.root, &url_path) {
-            Ok((path, metadata)) => find_applicable_share(&config.root, &path, &metadata)?.is_some(),
+            Ok((path, metadata)) => {
+                find_applicable_share(&config.root, &path, &metadata)?.is_some()
+            }
             Err(_) => true,
         };
         return write_html_response(
@@ -2452,7 +2483,9 @@ fn handle_delete_route(
             let (status, message) = match error.kind() {
                 io::ErrorKind::InvalidInput => ("400 Bad Request", "Bad request path."),
                 io::ErrorKind::NotFound => ("404 Not Found", "File not found."),
-                io::ErrorKind::PermissionDenied => ("403 Forbidden", "Path escapes served directory."),
+                io::ErrorKind::PermissionDenied => {
+                    ("403 Forbidden", "Path escapes served directory.")
+                }
                 _ => return Err(error),
             };
             return write_html_response(
@@ -2479,7 +2512,10 @@ fn handle_delete_route(
         );
     }
 
-    if path.file_name().is_some_and(|name| name == SHARE_FILE || name == UPLOAD_FILE) {
+    if path
+        .file_name()
+        .is_some_and(|name| name == SHARE_FILE || name == UPLOAD_FILE)
+    {
         return write_html_response(
             stream,
             "403 Forbidden",
@@ -2493,20 +2529,25 @@ fn handle_delete_route(
         );
     }
 
-    let require_pin = if let Some((_share_dir, share)) = find_applicable_share(&config.root, &path, &metadata)? {
-        if !share.allows_write(Some(&pin)) {
-            return write_html_response(
-                stream,
-                "403 Forbidden",
-                &delete_form_html(&url_path, Some("Read+write PIN required or incorrect."), true),
-                &[],
-                false,
-            );
-        }
-        true
-    } else {
-        false
-    };
+    let require_pin =
+        if let Some((_share_dir, share)) = find_applicable_share(&config.root, &path, &metadata)? {
+            if !share.allows_write(Some(&pin)) {
+                return write_html_response(
+                    stream,
+                    "403 Forbidden",
+                    &delete_form_html(
+                        &url_path,
+                        Some("Read+write PIN required or incorrect."),
+                        true,
+                    ),
+                    &[],
+                    false,
+                );
+            }
+            true
+        } else {
+            false
+        };
 
     if let Err(error) = fs::remove_file(&path) {
         return write_html_response(
@@ -2533,9 +2574,8 @@ fn handle_delete_route(
 }
 
 fn delete_target(root: &Path, url_path: &str) -> io::Result<(PathBuf, fs::Metadata)> {
-    let requested_path = path_for_request(root, url_path).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "bad request path")
-    })?;
+    let requested_path = path_for_request(root, url_path)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad request path"))?;
     let path = contained_path(root, &requested_path)?;
     let metadata = fs::metadata(&path)?;
     Ok((path, metadata))
@@ -2781,7 +2821,8 @@ fn handle_chunk_route(
         }
 
         let assembled_hash = hash_file(&temp_output)?;
-        let final_target = match unique_upload_target(&folder, &chunk_req.filename, &assembled_hash) {
+        let final_target = match unique_upload_target(&folder, &chunk_req.filename, &assembled_hash)
+        {
             Ok(target) => target,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let _ = fs::remove_file(&temp_output);
@@ -3101,8 +3142,6 @@ fn folder_form_html(path: &str, error: Option<&str>) -> String {
     body
 }
 
-
-
 fn remote_form_html(path: &str, error: Option<&str>) -> String {
     let mut body = String::new();
     body.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>New remote link</title><style>");
@@ -3116,14 +3155,15 @@ fn remote_form_html(path: &str, error: Option<&str>) -> String {
         body.push_str(&escape_html(error));
         body.push_str("</p>");
     }
-    body.push_str("<form method=\"post\" action=\"/__remote\"><input type=\"hidden\" name=\"path\" value=\"");
+    body.push_str(
+        "<form method=\"post\" action=\"/__remote\"><input type=\"hidden\" name=\"path\" value=\"",
+    );
     body.push_str(&escape_html(path));
     body.push_str("\"><label>Link name <span>shown in this folder</span><input name=\"name\" required placeholder=\"Work Drive\"></label><label>Remote Splinterparty URL <span>example: http://frankie:8080</span><input name=\"url\" required placeholder=\"http://frankie:8080\"></label><label>Remote path <span>example: /mira/doc1 or /general</span><input name=\"remote_path\" required value=\"/\"></label><label>Parent read+write PIN <span>required when creating inside a protected folder</span><input name=\"parent_pin\" type=\"password\"></label><button type=\"submit\">Create remote link</button></form><p class=\"muted\">Remote links are virtual symlinks between Splinterparty instances. The remote instance resolves its own local symlinks before serving files.</p><p><a class=\"up\" href=\"");
     body.push_str(&escape_html(path));
     body.push_str("\">Cancel</a></p></section></main></body></html>");
     body
 }
-
 
 fn delete_form_html(path: &str, error: Option<&str>, require_pin: bool) -> String {
     let mut body = String::new();
@@ -3138,13 +3178,17 @@ fn delete_form_html(path: &str, error: Option<&str>, require_pin: bool) -> Strin
         body.push_str(&escape_html(error));
         body.push_str("</p>");
     }
-    body.push_str("<form method=\"post\" action=\"/__delete\"><input type=\"hidden\" name=\"path\" value=\"");
+    body.push_str(
+        "<form method=\"post\" action=\"/__delete\"><input type=\"hidden\" name=\"path\" value=\"",
+    );
     body.push_str(&escape_html(path));
     body.push_str("\">");
     if require_pin {
         body.push_str("<label>Read+write PIN<input name=\"pin\" type=\"password\" autofocus required></label>");
     } else {
-        body.push_str("<p class=\"muted\">This file is outside a protected share, so no PIN is required.</p>");
+        body.push_str(
+            "<p class=\"muted\">This file is outside a protected share, so no PIN is required.</p>",
+        );
     }
     body.push_str("<button type=\"submit\">Delete file</button></form><p class=\"muted\">This permanently removes the file from the server directory.</p><p><a class=\"up\" href=\"");
     let parent = path
@@ -3187,10 +3231,7 @@ fn numbered_filename(filename: &str, index: u32) -> String {
     }
 
     let path = Path::new(filename);
-    let stem = path
-        .file_stem()
-        .and_then(OsStr::to_str)
-        .unwrap_or(filename);
+    let stem = path.file_stem().and_then(OsStr::to_str).unwrap_or(filename);
     let extension = path.extension().and_then(OsStr::to_str);
 
     match extension {
@@ -3251,7 +3292,6 @@ fn folder_operation_error_html(path: &str, error: &str) -> String {
     body.push_str("\">Back</a></p></section></main></body></html>");
     body
 }
-
 
 #[derive(Debug, Clone)]
 struct RemoteLink {
@@ -3432,7 +3472,10 @@ fn serve_directory(
             let entry = entry.ok()?;
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str == SHARE_FILE || name_str == UPLOAD_FILE || name_str.ends_with(".upload-parts") {
+            if name_str == SHARE_FILE
+                || name_str == UPLOAD_FILE
+                || name_str.ends_with(".upload-parts")
+            {
                 None
             } else {
                 Some(Ok(entry))
@@ -3470,7 +3513,9 @@ fn serve_directory(
     body.push_str("</span><small>items</small></div></header>");
 
     if let Some(remote_url) = tailscale_remote_url(bind_port) {
-        body.push_str("<section class=\"remote-card\"><strong>Tailscale remote access</strong><code>");
+        body.push_str(
+            "<section class=\"remote-card\"><strong>Tailscale remote access</strong><code>",
+        );
         body.push_str(&escape_html(&remote_url));
         body.push_str("</code><small>Open this URL from another device connected to the same Tailscale network.</small></section>");
     }
@@ -3495,21 +3540,23 @@ fn serve_directory(
             if let Ok(contents) = fs::read_to_string(entry.path()) {
                 if let Some(link) = RemoteLink::from_text(&contents) {
                     let href = link.href();
-                    body.push_str("<div class="row"><a class="name" href="");
+                    body.push_str("<div class=\"row\"><a class=\"name\" href=\"");
                     body.push_str(&escape_html(&href));
-                    body.push_str(""><span class="icon">NET</span><span>");
+                    body.push_str("\"><span class=\"icon\">NET</span><span>");
                     body.push_str(&escape_html(&link.name));
-                    body.push_str(" ↗</span></a><span class="type">Remote link</span><span>-</span><span>-</span><span class="actions"><a href="");
+                    body.push_str(" ↗</span></a><span class=\"type\">Remote link</span><span>-</span><span>-</span><span class=\"actions\"><a href=\"");
                     body.push_str(&escape_html(&href));
-                    body.push_str("">Open</a> ");
+                    body.push_str("\">Open</a> ");
+
                     let delete_path = format!(
                         "{}/{}",
                         url_path_for(root, path).trim_end_matches('/'),
                         url_encode_path_segment(&name)
                     );
-                    body.push_str("<a href="/__delete?path=");
+
+                    body.push_str("<a href=\"/__delete?path=");
                     body.push_str(&url_encode_query_value(&delete_path));
-                    body.push_str("">Delete</a></span></div>");
+                    body.push_str("\">Delete</a></span></div>");
                     continue;
                 }
             }
