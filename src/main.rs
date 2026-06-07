@@ -55,6 +55,15 @@ a:hover { text-decoration: underline; }
 .row.item[draggable="true"] { user-select: none; }
 .row.item.dragging { opacity: .55; }
 .row.item.drop-target { outline: 2px solid #155eef; outline-offset: -2px; background: #eef2ff; }
+.preview { position: fixed; inset: 0; z-index: 1200; display: none; grid-template-rows: auto 1fr; background: rgba(15, 23, 42, .86); color: #ffffff; }
+.preview.open { display: grid; }
+.preview-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 14px; background: rgba(15, 23, 42, .96); }
+.preview-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 750; }
+.preview-actions { display: flex; gap: 8px; align-items: center; }
+.preview-actions a, .preview-actions button { min-height: 34px; padding: 0 10px; border: 1px solid rgba(255,255,255,.24); border-radius: 8px; background: rgba(255,255,255,.08); color: #ffffff; font: inherit; font-weight: 700; text-decoration: none; cursor: pointer; }
+.preview-stage { min-height: 0; display: grid; place-items: center; padding: 12px; }
+.preview-stage img, .preview-stage video { max-width: 100%; max-height: 100%; object-fit: contain; background: #000000; }
+.preview-stage iframe { width: 100%; height: 100%; border: 0; background: #ffffff; }
 .empty { padding: 28px 16px; color: #657386; }
 .upload-panel { margin-top: 18px; border: 1px solid #d9dee7; border-radius: 8px; background: #ffffff; padding: 16px; }
 .upload-panel h2 { margin: 0 0 12px; font-size: 18px; }
@@ -4223,6 +4232,12 @@ fn serve_directory(
         body.push_str(if is_dir { "1" } else { "0" });
         body.push_str("\" data-download=\"");
         body.push_str(if !is_dir { "1" } else { "0" });
+        body.push_str("\" data-preview=\"");
+        body.push_str(if is_dir {
+            ""
+        } else {
+            preview_kind(entry.path().as_path()).unwrap_or("")
+        });
         body.push_str("\" data-delete=\"");
         body.push_str(if !is_dir || is_symlink { "1" } else { "0" });
         body.push_str("\" data-can-symlink=\"");
@@ -4271,7 +4286,9 @@ fn serve_directory(
         body.push_str("<div class=\"empty\">This directory is empty.</div>");
     }
 
-    body.push_str("</section><section class=\"upload-panel\"><h2>Upload file</h2>");
+    body.push_str(r##"</section><div id="preview" class="preview" aria-hidden="true"><div class="preview-bar"><div id="preview-title" class="preview-title"></div><div class="preview-actions"><a id="preview-open" href="#" target="_blank" rel="noopener">Open</a><a id="preview-download" href="#" download>Download</a><button id="preview-close" type="button">Close</button></div></div><div id="preview-stage" class="preview-stage"></div></div>"##);
+
+    body.push_str("<section class=\"upload-panel\"><h2>Upload file</h2>");
     body.push_str("<form id=\"upload-form\" method=\"post\" action=\"/__upload\" enctype=\"multipart/form-data\">");
     body.push_str("<input type=\"hidden\" name=\"path\" value=\"");
     body.push_str(&escape_html(&url_path_for(root, path)));
@@ -4342,6 +4359,9 @@ fn serve_directory(
     body.push_str("  setTimeout(()=>window.location.reload(),800);");
     body.push_str("});");
     body.push_str("})();");
+    body.push_str("</script>");
+    body.push_str("<script>");
+    body.push_str("(function(){const overlay=document.getElementById('preview');const stage=document.getElementById('preview-stage');if(!overlay||!stage)return;const title=document.getElementById('preview-title');const open=document.getElementById('preview-open');const down=document.getElementById('preview-download');const close=document.getElementById('preview-close');function hide(){overlay.classList.remove('open');overlay.setAttribute('aria-hidden','true');stage.innerHTML='';}function show(row){const kind=row.dataset.preview;if(!kind)return false;const src=row.dataset.path;const name=row.dataset.name||src;stage.innerHTML='';title.textContent=name;open.href=src;down.href=src;let el;if(kind==='image'){el=document.createElement('img');el.alt=name;el.src=src;}else if(kind==='video'){el=document.createElement('video');el.src=src;el.controls=true;el.autoplay=true;el.playsInline=true;}else if(kind==='pdf'){el=document.createElement('iframe');el.src=src;}else{return false;}stage.appendChild(el);overlay.classList.add('open');overlay.setAttribute('aria-hidden','false');return true;}close.addEventListener('click',hide);overlay.addEventListener('click',e=>{if(e.target===overlay)hide();});document.addEventListener('keydown',e=>{if(e.key==='Escape')hide();});document.querySelectorAll('.row.item').forEach(row=>{const link=row.querySelector('a.name');if(!link)return;link.addEventListener('click',e=>{if(show(row))e.preventDefault();});});})();");
     body.push_str("</script>");
 
     body.push_str(
@@ -4511,6 +4531,8 @@ fn write_redirect_with_cookie(
 
 fn content_type(path: &Path) -> &'static str {
     match path.extension().and_then(OsStr::to_str) {
+        Some("avif") => "image/avif",
+        Some("bmp") => "image/bmp",
         Some("css") => "text/css; charset=utf-8",
         Some("csv") => "text/csv; charset=utf-8",
         Some("gif") => "image/gif",
@@ -4518,13 +4540,32 @@ fn content_type(path: &Path) -> &'static str {
         Some("jpg") | Some("jpeg") => "image/jpeg",
         Some("js") => "text/javascript; charset=utf-8",
         Some("json") => "application/json; charset=utf-8",
+        Some("m4v") => "video/x-m4v",
+        Some("mkv") => "video/x-matroska",
+        Some("mov") => "video/quicktime",
+        Some("mp4") => "video/mp4",
+        Some("ogv") => "video/ogg",
         Some("pdf") => "application/pdf",
         Some("png") => "image/png",
         Some("svg") => "image/svg+xml",
         Some("txt") => "text/plain; charset=utf-8",
         Some("wasm") => "application/wasm",
+        Some("webm") => "video/webm",
         Some("webp") => "image/webp",
         _ => "application/octet-stream",
+    }
+}
+
+fn preview_kind(path: &Path) -> Option<&'static str> {
+    let extension = path
+        .extension()
+        .and_then(OsStr::to_str)?
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "avif" | "bmp" | "gif" | "jpg" | "jpeg" | "png" | "svg" | "webp" => Some("image"),
+        "pdf" => Some("pdf"),
+        "m4v" | "mkv" | "mov" | "mp4" | "ogv" | "webm" => Some("video"),
+        _ => None,
     }
 }
 
