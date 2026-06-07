@@ -1559,12 +1559,12 @@ fn handle_connection(mut stream: TcpStream, config: &Config) -> io::Result<()> {
         Err(error) => return Err(error),
     };
 
-    if !requested_is_symlink {
     let pin = request_pin(&request);
-    if let Some((_share_dir, share)) = find_applicable_share(&config.root, &path, &metadata)? {
-        if !share.allows_read(pin.as_deref()) {
-            log_request(&peer, &request, "401");
-            return write_html_response(
+    if !requested_is_symlink {
+        if let Some((_share_dir, share)) = find_applicable_share(&config.root, &path, &metadata)? {
+            if !share.allows_read(pin.as_deref()) {
+                log_request(&peer, &request, "401");
+                return write_html_response(
                     &mut stream,
                     "401 Unauthorized",
                     &pin_prompt_html(&request.target, true),
@@ -2886,14 +2886,7 @@ fn handle_move_route(stream: &mut TcpStream, config: &Config, request: &Request)
     let form = String::from_utf8_lossy(&request.body);
     let source_path = form_value(&form, "source").unwrap_or_default();
     let destination_path = form_value(&form, "destination").unwrap_or_default();
-    let source_pin = form_value(&form, "source_pin")
-        .filter(|pin| !pin.is_empty())
-        .or_else(|| request_pin(request))
-        .unwrap_or_default();
-    let destination_pin = form_value(&form, "destination_pin")
-        .filter(|pin| !pin.is_empty())
-        .or_else(|| request_pin(request))
-        .unwrap_or_default();
+    let pin = request_pin(request).unwrap_or_default();
 
     let (source, source_metadata) = match move_source(&config.root, &source_path) {
         Ok(source) => source,
@@ -2922,7 +2915,7 @@ fn handle_move_route(stream: &mut TcpStream, config: &Config, request: &Request)
     };
 
     let destination_metadata = fs::metadata(&destination)?;
-    if !share_allows_write(&config.root, &source, &source_metadata, Some(&source_pin))? {
+    if !share_allows_write(&config.root, &source, &source_metadata, Some(&pin))? {
         return write_text_response(
             stream,
             "403 Forbidden",
@@ -2936,7 +2929,7 @@ fn handle_move_route(stream: &mut TcpStream, config: &Config, request: &Request)
         &config.root,
         &destination,
         &destination_metadata,
-        Some(&destination_pin),
+        Some(&pin),
     )? {
         return write_text_response(
             stream,
@@ -3040,10 +3033,7 @@ fn handle_copy_route(stream: &mut TcpStream, config: &Config, request: &Request)
     let form = String::from_utf8_lossy(&request.body);
     let source_path = form_value(&form, "source").unwrap_or_default();
     let destination_path = form_value(&form, "destination").unwrap_or_default();
-    let destination_pin = form_value(&form, "destination_pin")
-        .filter(|pin| !pin.is_empty())
-        .or_else(|| request_pin(request))
-        .unwrap_or_default();
+    let pin = request_pin(request).unwrap_or_default();
 
     let (source, source_metadata) = match move_source(&config.root, &source_path) {
         Ok(source) => source,
@@ -3076,7 +3066,7 @@ fn handle_copy_route(stream: &mut TcpStream, config: &Config, request: &Request)
         &config.root,
         &destination,
         &destination_metadata,
-        Some(&destination_pin),
+        Some(&pin),
     )? {
         return write_text_response(
             stream,
@@ -4359,6 +4349,9 @@ fn serve_directory(
     <a id="ctx-open" href="#">Open</a>
     <a id="ctx-download" href="#" download>Download</a>
     <button id="ctx-symlink" type="button">Symlink to this file…</button>
+    <button id="ctx-copy" type="button">Copy</button>
+    <button id="ctx-cut" type="button">Cut</button>
+    <button id="ctx-paste" type="button">Paste</button>
     <button id="ctx-folder" type="button">New folder here…</button>
     <a id="ctx-delete" class="danger" href="#">Delete…</a>
     </div>"##,
@@ -4366,10 +4359,12 @@ fn serve_directory(
     body.push_str("<script>");
     body.push_str("(function(){const menu=document.getElementById('context-menu');if(!menu)return;let current=null;const currentFolder='");
     body.push_str(&folder_url_path);
-    body.push_str("';const open=document.getElementById('ctx-open');const down=document.getElementById('ctx-download');const del=document.getElementById('ctx-delete');const sym=document.getElementById('ctx-symlink');const folder=document.getElementById('ctx-folder');function hide(){menu.style.display='none';}function folderTarget(){if(current&&current.dataset.isDir==='1')return current.dataset.path;return currentFolder;}document.addEventListener('click',hide);document.addEventListener('keydown',e=>{if(e.key==='Escape')hide();});document.querySelectorAll('.row.item').forEach(row=>{row.addEventListener('contextmenu',e=>{e.preventDefault();current=row;const path=row.dataset.path;open.href=path;down.href=path;down.style.display=row.dataset.download==='1'?'block':'none';del.href='/__delete?path='+encodeURIComponent(row.dataset.deletePath||path);del.style.display=row.dataset.delete==='1'?'block':'none';sym.style.display=row.dataset.canSymlink==='1'?'block':'none';menu.style.left=Math.min(e.clientX,window.innerWidth-220)+'px';menu.style.top=Math.min(e.clientY,window.innerHeight-230)+'px';menu.style.display='block';});});sym.addEventListener('click',()=>{if(!current)return;hide();const target=current.dataset.path;const defaultName=current.dataset.name||'link';const name=prompt('Symlink name:', defaultName);if(!name)return;const params=new URLSearchParams({path:currentFolder,target_path:target,name:name});window.location.href='/__symlink?'+params.toString();});folder.addEventListener('click',()=>{hide();window.location.href='/__folder?path='+encodeURIComponent(folderTarget());});})();");
+    body.push_str("';const canWrite=");
+    body.push_str(if can_write_here { "true" } else { "false" });
+    body.push_str(";const clipKey='splinterparty.clipboard';let clip=loadClip();const open=document.getElementById('ctx-open');const down=document.getElementById('ctx-download');const del=document.getElementById('ctx-delete');const sym=document.getElementById('ctx-symlink');const copy=document.getElementById('ctx-copy');const cut=document.getElementById('ctx-cut');const paste=document.getElementById('ctx-paste');const folder=document.getElementById('ctx-folder');function loadClip(){try{return JSON.parse(sessionStorage.getItem(clipKey)||'null');}catch(_){return null;}}function saveClip(value){clip=value;if(value){sessionStorage.setItem(clipKey,JSON.stringify(value));}else{sessionStorage.removeItem(clipKey);}}function hide(){menu.style.display='none';}function folderTarget(){if(current&&current.dataset.isDir==='1')return current.dataset.path;return currentFolder;}function canClip(row){return canWrite&&row&&row.dataset.canDrag==='1';}async function transfer(endpoint,source,destination){const body=new URLSearchParams({source:source,destination:destination});const resp=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});if(resp.ok||resp.status===204){window.location.reload();return;}alert((await resp.text())||'Could not complete operation.');}document.addEventListener('click',hide);document.addEventListener('keydown',e=>{if(e.key==='Escape')hide();});document.querySelectorAll('.row.item').forEach(row=>{row.addEventListener('contextmenu',e=>{e.preventDefault();clip=loadClip();current=row;const path=row.dataset.path;open.href=path;down.href=path;down.style.display=row.dataset.download==='1'?'block':'none';del.href='/__delete?path='+encodeURIComponent(row.dataset.deletePath||path);del.style.display=row.dataset.delete==='1'?'block':'none';sym.style.display=row.dataset.canSymlink==='1'?'block':'none';copy.style.display=canClip(row)?'block':'none';cut.style.display=canClip(row)?'block':'none';paste.style.display=canWrite&&clip?'block':'none';folder.style.display=canWrite?'block':'none';menu.style.left=Math.min(e.clientX,window.innerWidth-220)+'px';menu.style.top=Math.min(e.clientY,window.innerHeight-270)+'px';menu.style.display='block';});});sym.addEventListener('click',()=>{if(!current)return;hide();const target=current.dataset.path;const defaultName=current.dataset.name||'link';const name=prompt('Symlink name:', defaultName);if(!name)return;const params=new URLSearchParams({path:currentFolder,target_path:target,name:name});window.location.href='/__symlink?'+params.toString();});copy.addEventListener('click',()=>{if(!canClip(current))return;saveClip({path:current.dataset.path,mode:'copy'});hide();});cut.addEventListener('click',()=>{if(!canClip(current))return;saveClip({path:current.dataset.path,mode:'cut'});hide();});paste.addEventListener('click',()=>{clip=loadClip();if(!canWrite||!clip)return;const dest=folderTarget();const endpoint=clip.mode==='cut'?'/__move':'/__copy';const source=clip.path;if(clip.mode==='cut')saveClip(null);hide();transfer(endpoint,source,dest);});folder.addEventListener('click',()=>{hide();window.location.href='/__folder?path='+encodeURIComponent(folderTarget());});window.splinterTransfer=transfer;})();");
     body.push_str("</script>");
     body.push_str("<script>");
-    body.push_str("(function(){let dragged=null;async function moveItem(source,destination,pin){const body=new URLSearchParams({source:source,destination:destination});if(pin)body.set('pin',pin);return fetch('/__move',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});}async function dropMove(source,destination){let resp=await moveItem(source,destination,'');if(resp.status===403){const pin=prompt('Read+write PIN for the source and destination folders:');if(pin===null)return;resp=await moveItem(source,destination,pin);}if(resp.ok||resp.status===204){window.location.reload();return;}alert((await resp.text())||'Could not move item.');}document.querySelectorAll('.row.item').forEach(row=>{if(row.dataset.canDrag==='1'){row.addEventListener('dragstart',e=>{dragged=row;row.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',row.dataset.path);});row.addEventListener('dragend',()=>{row.classList.remove('dragging');dragged=null;document.querySelectorAll('.drop-target').forEach(el=>el.classList.remove('drop-target'));});}if(row.dataset.dropTarget==='1'){row.addEventListener('dragover',e=>{if(!dragged||dragged===row)return;e.preventDefault();e.dataTransfer.dropEffect='move';row.classList.add('drop-target');});row.addEventListener('dragleave',()=>row.classList.remove('drop-target'));row.addEventListener('drop',e=>{if(!dragged||dragged===row)return;e.preventDefault();row.classList.remove('drop-target');const source=dragged.dataset.path;const destination=row.dataset.path;dropMove(source,destination);});}});})();");
+    body.push_str("(function(){let dragged=null;document.querySelectorAll('.row.item').forEach(row=>{if(row.dataset.canDrag==='1'){row.addEventListener('dragstart',e=>{dragged=row;row.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',row.dataset.path);});row.addEventListener('dragend',()=>{row.classList.remove('dragging');dragged=null;document.querySelectorAll('.drop-target').forEach(el=>el.classList.remove('drop-target'));});}if(row.dataset.dropTarget==='1'){row.addEventListener('dragover',e=>{if(!dragged||dragged===row)return;e.preventDefault();e.dataTransfer.dropEffect='move';row.classList.add('drop-target');});row.addEventListener('dragleave',()=>row.classList.remove('drop-target'));row.addEventListener('drop',e=>{if(!dragged||dragged===row)return;e.preventDefault();row.classList.remove('drop-target');const source=dragged.dataset.path;const destination=row.dataset.path;if(window.splinterTransfer)window.splinterTransfer('/__move',source,destination);});}});})();");
     body.push_str("</script>");
 
     body.push_str("</section></main></body></html>\n");
