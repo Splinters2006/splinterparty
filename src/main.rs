@@ -83,7 +83,7 @@ a:hover { text-decoration: underline; }
 
 .row {
     display: grid;
-    grid-template-columns: minmax(260px, 1fr) 140px 120px 180px 120px;
+    grid-template-columns: minmax(260px, 1fr) 140px 120px 180px;
     gap: 14px;
     align-items: center;
     min-height: 52px;
@@ -132,18 +132,21 @@ a:hover { text-decoration: underline; }
     color: #9a3412;
     font-weight: 750;
 }
-
-.actions {
+.name-cell {
     display: flex;
-    justify-content: flex-end;
+    align-items: center;
     gap: 10px;
-    white-space: nowrap;
+    min-width: 0;
 }
 
-.actions a {
-    font-weight: 650;
+.select-box {
+    flex: 0 0 auto;
+    width: 16px;
+    height: 16px;
+    margin: 0;
+    accent-color: #155eef;
+    cursor: pointer;
 }
-
 @media (max-width: 760px) {
     .row {
         grid-template-columns: 1fr;
