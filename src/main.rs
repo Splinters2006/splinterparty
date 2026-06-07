@@ -3887,22 +3887,23 @@ fn share_form_html(path: &str, existing: bool, error: Option<&str>) -> String {
 
 fn folder_form_html(path: &str, error: Option<&str>) -> String {
     let mut body = String::new();
-    body.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>New folder</title><style>");
-    body.push_str(DIRECTORY_CSS);
-    body.push_str(FORM_CSS);
-    body.push_str("</style></head><body><main class=\"form-page\"><section class=\"panel\"><p class=\"eyebrow\">Splinterparty</p><h1>New folder</h1><p class=\"muted\">");
-    body.push_str(&escape_html(path));
-    body.push_str("</p>");
-    if let Some(error) = error {
-        body.push_str("<p class=\"error\">");
-        body.push_str(&escape_html(error));
-        body.push_str("</p>");
-    }
     body.push_str(
         "<form method=\"post\" action=\"/__folder\" autocomplete=\"off\"><input type=\"hidden\" name=\"path\" value=\"",
     );
     body.push_str(&escape_html(path));
-    body.push_str("\"><label>Folder name<input name=\"name\" required></label><label>Parent read+write PIN <span>required when creating inside a protected folder</span><input name=\"parent_pin\" type=\"password\" autocomplete=\"new-password\"></label><label>Recovery passcode <span>optional; required only for protected folders</span><input name=\"recovery\" type=\"password\" autocomplete=\"new-password\"></label><label>Read PIN <span>optional for protected sharing</span><input name=\"read_pin\" type=\"password\" autocomplete=\"new-password\"></label><label>Read+write PIN <span>optional; required only for protected folders</span><input name=\"write_pin\" type=\"password\" autocomplete=\"new-password\"></label><button type=\"submit\">Create folder</button></form><p class=\"error\">If you leave the PIN fields empty, anyone with this folder link and access to the general Splinterparty login can open it.</p><p class=\"muted\">To protect the new folder, enter a recovery passcode and read+write PIN.</p></section></main></body></html>");
+    body.push_str("\">");
+
+    body.push_str("<label>Folder name<input name=\"name\" required autocomplete=\"off\"></label>");
+
+    body.push_str("<label>Parent read+write PIN <span>required if this folder is inside a protected folder</span><input name=\"parent_pin\" type=\"password\" autocomplete=\"new-password\"></label>");
+
+    body.push_str("<label>Recovery password <span>required to change this folder's PINs later</span><input name=\"recovery\" type=\"password\" autocomplete=\"new-password\" required></label>");
+
+    body.push_str("<label>Read PIN <span>guest access / read-only</span><input name=\"read_pin\" type=\"password\" autocomplete=\"new-password\" required></label>");
+
+    body.push_str("<label>Read+write PIN <span>elevated access / upload, delete, symlink, rename</span><input name=\"write_pin\" type=\"password\" autocomplete=\"new-password\" required></label>");
+
+    body.push_str("<button type=\"submit\">Create folder</button></form>");
     body
 }
 
@@ -4350,8 +4351,15 @@ fn serve_directory(
     body.push_str(&url_encode_query_value(&url_path_for(root, path)));
     body.push_str("\">Share settings</a></nav>");
 
-    body.push_str("<section class=\"browser\"><div class=\"row head\"><span>Name</span><span>Type</span><span>Size</span><span>Modified</span></div>");
+    let current_url_path = url_path_for(root, path);
 
+    body.push_str("<section class=\"browser\">");
+
+    body.push_str("<div class=\"browser-top\"><span class=\"browser-top-title\">Files</span><a class=\"plus-button\" title=\"Create folder\" href=\"/__folder?path=");
+    body.push_str(&url_encode_query_value(&current_url_path));
+    body.push_str("\">+</a></div>");
+
+    body.push_str("<div class=\"row head\"><span>Name</span><span>Type</span><span>Size</span><span>Modified</span></div>");
     if !relative.as_os_str().is_empty() {
         let parent_path = path.parent().unwrap_or(root);
         let parent_url_path = url_path_for(root, parent_path);
