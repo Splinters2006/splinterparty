@@ -1491,6 +1491,9 @@ fn handle_connection(mut stream: TcpStream, config: &Config) -> io::Result<()> {
             );
         }
     };
+    let requested_is_symlink = fs::symlink_metadata(&requested_path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false);
 
     let path = match contained_path(&config.root, &requested_path) {
         Ok(path) => path,
@@ -1543,17 +1546,19 @@ fn handle_connection(mut stream: TcpStream, config: &Config) -> io::Result<()> {
         Err(error) => return Err(error),
     };
 
-    if let Some((_share_dir, share)) = find_applicable_share(&config.root, &path, &metadata)? {
-        let pin = request_pin(&request);
-        if !share.allows_read(pin.as_deref()) {
-            log_request(&peer, &request, "401");
-            return write_html_response(
-                &mut stream,
-                "401 Unauthorized",
-                &pin_prompt_html(&request.target, true),
-                &[("WWW-Authenticate", "PIN realm=\"Splinterparty\"")],
-                request.method == "HEAD",
-            );
+    if !requested_is_symlink {
+        if let Some((_share_dir, share)) = find_applicable_share(&config.root, &path, &metadata)? {
+            let pin = request_pin(&request);
+            if !share.allows_read(pin.as_deref()) {
+                log_request(&peer, &request, "401");
+                return write_html_response(
+                    &mut stream,
+                    "401 Unauthorized",
+                    &pin_prompt_html(&request.target, true),
+                    &[("WWW-Authenticate", "PIN realm=\"Splinterparty\"")],
+                    request.method == "HEAD",
+                );
+            }
         }
     }
 
@@ -3359,10 +3364,10 @@ fn pin_prompt_html(path: &str, invalid: bool) -> String {
         body.push_str("<p class=\"error\">PIN required or incorrect.</p>");
     }
     body.push_str(
-        "<form method=\"post\" action=\"/__pin\"><input type=\"hidden\" name=\"path\" value=\"",
+        "<form method=\"post\" action=\"/__pin\" autocomplete=\"off\"><input type=\"hidden\" name=\"path\" value=\"",
     );
     body.push_str(&escape_html(path));
-    body.push_str("\"><label>Access level<select name=\"access\"><option value=\"guest\">Guest / read-only</option><option value=\"elevated\">Elevated / read+write</option></select></label><label>PIN<input name=\"pin\" type=\"password\" autofocus required></label><button type=\"submit\">Open folder</button></form></section></main></body></html>");
+    body.push_str("\"><label>Access level<select name=\"access\"><option value=\"guest\">Guest / read-only</option><option value=\"elevated\">Elevated / read+write</option></select></label><label>PIN<input name=\"pin\" type=\"password\" autocomplete=\"new-password\" autofocus required></label><button type=\"submit\">Open folder</button></form></section></main></body></html>");
     body
 }
 fn share_form_html(path: &str, existing: bool, error: Option<&str>) -> String {
@@ -3379,10 +3384,10 @@ fn share_form_html(path: &str, existing: bool, error: Option<&str>) -> String {
         body.push_str("</p>");
     }
     body.push_str(
-        "<form method=\"post\" action=\"/__share\"><input type=\"hidden\" name=\"path\" value=\"",
+        "<form method=\"post\" action=\"/__share\" autocomplete=\"off\"><input type=\"hidden\" name=\"path\" value=\"",
     );
     body.push_str(&escape_html(path));
-    body.push_str("\"><label>Recovery passcode<input name=\"recovery\" type=\"password\" required></label><label>Read PIN <span>optional for sharing downloads</span><input name=\"read_pin\" type=\"password\"></label><label>Read+write PIN <span>required for owner access</span><input name=\"write_pin\" type=\"password\" required></label><button type=\"submit\">");
+    body.push_str("\"><label>Recovery passcode<input name=\"recovery\" type=\"password\" autocomplete=\"new-password\" required></label><label>Read PIN <span>optional for sharing downloads</span><input name=\"read_pin\" type=\"password\" autocomplete=\"new-password\"></label><label>Read+write PIN <span>required for owner access</span><input name=\"write_pin\" type=\"password\" autocomplete=\"new-password\" required></label><button type=\"submit\">");
     body.push_str(if existing {
         "Change PINs"
     } else {
@@ -3406,10 +3411,10 @@ fn folder_form_html(path: &str, error: Option<&str>) -> String {
         body.push_str("</p>");
     }
     body.push_str(
-        "<form method=\"post\" action=\"/__folder\"><input type=\"hidden\" name=\"path\" value=\"",
+        "<form method=\"post\" action=\"/__folder\" autocomplete=\"off\"><input type=\"hidden\" name=\"path\" value=\"",
     );
     body.push_str(&escape_html(path));
-    body.push_str("\"><label>Folder name<input name=\"name\" required></label><label>Parent read+write PIN <span>required when creating inside a protected folder</span><input name=\"parent_pin\" type=\"password\"></label><label>Recovery passcode<input name=\"recovery\" type=\"password\" required></label><label>Read PIN <span>optional for sharing downloads</span><input name=\"read_pin\" type=\"password\"></label><label>Read+write PIN <span>required for owner access</span><input name=\"write_pin\" type=\"password\" required></label><button type=\"submit\">Create folder</button></form><p class=\"muted\">The recovery passcode is required to change this folder's PINs later.</p></section></main></body></html>");
+    body.push_str("\"><label>Folder name<input name=\"name\" required></label><label>Parent read+write PIN <span>required when creating inside a protected folder</span><input name=\"parent_pin\" type=\"password\" autocomplete=\"new-password\"></label><label>Recovery passcode<input name=\"recovery\" type=\"password\" autocomplete=\"new-password\" required></label><label>Read PIN <span>optional for sharing downloads</span><input name=\"read_pin\" type=\"password\" autocomplete=\"new-password\"></label><label>Read+write PIN <span>required for owner access</span><input name=\"write_pin\" type=\"password\" autocomplete=\"new-password\" required></label><button type=\"submit\">Create folder</button></form><p class=\"muted\">The recovery passcode is required to change this folder's PINs later.</p></section></main></body></html>");
     body
 }
 
@@ -3428,14 +3433,13 @@ fn write_symlink_form_response(
 }
 
 fn symlink_form_html_with_values(
-    config: &Config,
-    pin: Option<&str>,
+    _config: &Config,
+    _pin: Option<&str>,
     path: &str,
     error: Option<&str>,
     target_path: &str,
     name: &str,
 ) -> io::Result<String> {
-    let folders = accessible_folder_paths(&config.root, pin)?;
     let mut body = String::new();
     body.push_str(r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>New symlink</title><style>"#);
     body.push_str(DIRECTORY_CSS);
@@ -3448,24 +3452,13 @@ fn symlink_form_html_with_values(
         body.push_str(&escape_html(error));
         body.push_str("</p>");
     }
-    body.push_str(r#"<form method="post" action="/__symlink"><label>Destination folder <span>folders readable with your current access</span><select name="path" required>"#);
-    for folder in folders {
-        let folder_path = url_path_for(&config.root, &folder);
-        body.push_str(r#"<option value=""#);
-        body.push_str(&escape_html(&folder_path));
-        body.push('"');
-        if folder_path == path {
-            body.push_str(" selected");
-        }
-        body.push('>');
-        body.push_str(&escape_html(&folder_path));
-        body.push_str("</option>");
-    }
-    body.push_str(r#"</select></label><label>Symlink name <span>shown in the destination folder</span><input name="name" required placeholder="doc1.pdf" value=""#);
+    body.push_str(r#"<form method="post" action="/__symlink" autocomplete="off"><label>Destination folder <span>type any folder path you can write to, example: /family</span><input name="path" required placeholder="/family" autocomplete="off" value=""#);
+    body.push_str(&escape_html(path));
+    body.push_str(r#""></label><label>Symlink name <span>shown in the destination folder</span><input name="name" required placeholder="doc1.pdf" autocomplete="off" value=""#);
     body.push_str(&escape_html(name));
-    body.push_str(r#""></label><label>Target path <span>existing file/folder on this Splinterparty instance, example: /family/shared.pdf</span><input name="target_path" required placeholder="/family/shared.pdf" value=""#);
+    body.push_str(r#""></label><label>Target path <span>type any existing file or folder path, example: /family/shared.pdf</span><input name="target_path" required placeholder="/family/shared.pdf" autocomplete="off" value=""#);
     body.push_str(&escape_html(target_path));
-    body.push_str(r#""></label><label>Destination read+write PIN <span>required if the destination folder is protected</span><input name="parent_pin" type="password"></label><label>Target read PIN <span>required if the target is inside a protected folder</span><input name="target_pin" type="password"></label><button type="submit">Create symlink</button></form><p class="muted">A symlink points to an existing file or folder on this same server, so the file is not stored twice. Symlinks are only allowed when their resolved target stays inside the served Splinterparty root.</p><p><a class="up" href=""#);
+    body.push_str(r#""></label><label>Destination read+write PIN <span>required if the destination folder is protected</span><input name="parent_pin" type="password" autocomplete="new-password"></label><label>Target read PIN <span>required if the target is inside a protected folder</span><input name="target_pin" type="password" autocomplete="new-password"></label><button type="submit">Create symlink</button></form><p class="muted">A symlink points to an existing file or folder on this same server, so the file is not stored twice. Symlinks are only allowed when their resolved target stays inside the served Splinterparty root.</p><p><a class="up" href=""#);
     body.push_str(&escape_html(path));
     body.push_str(r#"">Cancel</a></p></section></main></body></html>"#);
     Ok(body)
@@ -3485,10 +3478,10 @@ fn remote_form_html(path: &str, error: Option<&str>) -> String {
         body.push_str("</p>");
     }
     body.push_str(
-        "<form method=\"post\" action=\"/__remote\"><input type=\"hidden\" name=\"path\" value=\"",
+        "<form method=\"post\" action=\"/__remote\" autocomplete=\"off\"><input type=\"hidden\" name=\"path\" value=\"",
     );
     body.push_str(&escape_html(path));
-    body.push_str("\"><label>Link name <span>shown in this folder</span><input name=\"name\" required placeholder=\"Work Drive\"></label><label>Remote Splinterparty URL <span>example: http://frankie:8080</span><input name=\"url\" required placeholder=\"http://frankie:8080\"></label><label>Remote path <span>example: /mira/doc1 or /general</span><input name=\"remote_path\" required value=\"/\"></label><label>Parent read+write PIN <span>required when creating inside a protected folder</span><input name=\"parent_pin\" type=\"password\"></label><button type=\"submit\">Create remote link</button></form><p class=\"muted\">Remote links are virtual symlinks between Splinterparty instances. The remote instance resolves its own local symlinks before serving files.</p><p><a class=\"up\" href=\"");
+    body.push_str("\"><label>Link name <span>shown in this folder</span><input name=\"name\" required placeholder=\"Work Drive\" autocomplete=\"off\"></label><label>Remote Splinterparty URL <span>example: http://frankie:8080</span><input name=\"url\" required placeholder=\"http://frankie:8080\" autocomplete=\"off\"></label><label>Remote path <span>example: /mira/doc1 or /general</span><input name=\"remote_path\" required autocomplete=\"off\" value=\"/\"></label><label>Parent read+write PIN <span>required when creating inside a protected folder</span><input name=\"parent_pin\" type=\"password\" autocomplete=\"new-password\"></label><button type=\"submit\">Create remote link</button></form><p class=\"muted\">Remote links are virtual symlinks between Splinterparty instances. The remote instance resolves its own local symlinks before serving files.</p><p><a class=\"up\" href=\"");
     body.push_str(&escape_html(path));
     body.push_str("\">Cancel</a></p></section></main></body></html>");
     body
@@ -3508,12 +3501,12 @@ fn delete_form_html(path: &str, error: Option<&str>, require_pin: bool) -> Strin
         body.push_str("</p>");
     }
     body.push_str(
-        "<form method=\"post\" action=\"/__delete\"><input type=\"hidden\" name=\"path\" value=\"",
+        "<form method=\"post\" action=\"/__delete\" autocomplete=\"off\"><input type=\"hidden\" name=\"path\" value=\"",
     );
     body.push_str(&escape_html(path));
     body.push_str("\">");
     if require_pin {
-        body.push_str("<label>Read+write PIN<input name=\"pin\" type=\"password\" autofocus required></label>");
+        body.push_str("<label>Read+write PIN<input name=\"pin\" type=\"password\" autocomplete=\"new-password\" autofocus required></label>");
     } else {
         body.push_str(
             "<p class=\"muted\">This file is outside a protected share, so no PIN is required.</p>",
@@ -3766,52 +3759,6 @@ fn contained_path(root: &Path, requested_path: &Path) -> io::Result<PathBuf> {
             "resolved path escapes served directory",
         ))
     }
-}
-
-fn accessible_folder_paths(root: &Path, pin: Option<&str>) -> io::Result<Vec<PathBuf>> {
-    let mut folders = Vec::new();
-    collect_accessible_folders(root, root, pin, &mut folders)?;
-    folders.sort_by_key(|folder| url_path_for(root, folder));
-    Ok(folders)
-}
-
-fn collect_accessible_folders(
-    root: &Path,
-    folder: &Path,
-    pin: Option<&str>,
-    folders: &mut Vec<PathBuf>,
-) -> io::Result<()> {
-    let symlink_metadata = fs::symlink_metadata(folder)?;
-    if symlink_metadata.file_type().is_symlink() {
-        return Ok(());
-    }
-
-    let metadata = fs::metadata(folder)?;
-    if !metadata.is_dir() {
-        return Ok(());
-    }
-
-    if let Some((_share_dir, share)) = find_applicable_share(root, folder, &metadata)? {
-        if !share.allows_read(pin) {
-            return Ok(());
-        }
-    }
-
-    folders.push(folder.to_path_buf());
-
-    for entry in fs::read_dir(folder)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if name_str == SHARE_FILE || name_str == UPLOAD_FILE || name_str.ends_with(".upload-parts")
-        {
-            continue;
-        }
-
-        collect_accessible_folders(root, &entry.path(), pin, folders)?;
-    }
-
-    Ok(())
 }
 
 fn percent_decode(value: &str) -> Option<String> {
