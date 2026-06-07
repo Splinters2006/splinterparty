@@ -1470,6 +1470,11 @@ fn handle_connection(mut stream: TcpStream, config: &Config) -> io::Result<()> {
         return handle_delete_route(&mut stream, config, &request);
     }
 
+    if request.target.starts_with("/__rename") {
+        log_request(&peer, &request, "200");
+        return handle_rename_route(&mut stream, config, &request);
+    }
+
     if request.target.starts_with("/__move") {
         log_request(&peer, &request, "200");
         return handle_move_route(&mut stream, config, &request);
@@ -2921,6 +2926,114 @@ fn delete_target(root: &Path, url_path: &str) -> io::Result<(PathBuf, fs::Metada
     Ok((path, metadata))
 }
 
+fn handle_rename_route(
+    stream: &mut TcpStream,
+    config: &Config,
+    request: &Request,
+) -> io::Result<()> {
+    if request.method != "POST" {
+        return write_text_response(
+            stream,
+            "405 Method Not Allowed",
+            "Method not allowed\n",
+            &[("Allow", "POST")],
+            false,
+        );
+    }
+
+    let form = String::from_utf8_lossy(&request.body);
+    let source_path = form_value(&form, "source").unwrap_or_default();
+    let new_name = form_value(&form, "name").unwrap_or_default();
+    let pin = request_pin(request).unwrap_or_default();
+
+    if !is_safe_folder_name(&new_name) {
+        return write_text_response(
+            stream,
+            "400 Bad Request",
+            "Name cannot be empty or contain path separators.\n",
+            &[],
+            false,
+        );
+    }
+
+    let (source, source_metadata) = match delete_target(&config.root, &source_path) {
+        Ok(source) => source,
+        Err(error) => {
+            return write_text_response(
+                stream,
+                move_error_status(&error),
+                &format!("Could not rename source: {error}\n"),
+                &[],
+                false,
+            );
+        }
+    };
+
+    let is_symlink = source_metadata.file_type().is_symlink();
+    if !source_metadata.is_file() && !source_metadata.is_dir() && !is_symlink {
+        return write_text_response(
+            stream,
+            "400 Bad Request",
+            "Only files, folders, and symlinks can be renamed.\n",
+            &[],
+            false,
+        );
+    }
+
+    if source
+        .file_name()
+        .is_some_and(|name| name == SHARE_FILE || name == UPLOAD_FILE)
+    {
+        return write_text_response(
+            stream,
+            "403 Forbidden",
+            "Internal Splinterparty files cannot be renamed.\n",
+            &[],
+            false,
+        );
+    }
+
+    if !share_allows_write(&config.root, &source, &source_metadata, Some(&pin))? {
+        return write_text_response(
+            stream,
+            "403 Forbidden",
+            "Read+write PIN required or incorrect.\n",
+            &[],
+            false,
+        );
+    }
+
+    let parent = source
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad source path"))?;
+    let target = parent.join(new_name);
+    if source == target {
+        return write_text_response(stream, "204 No Content", "", &[], false);
+    }
+
+    if target.exists() || fs::symlink_metadata(&target).is_ok() {
+        return write_text_response(
+            stream,
+            "409 Conflict",
+            "A file, folder, or symlink with that name already exists.\n",
+            &[],
+            false,
+        );
+    }
+
+    if let Err(error) = fs::rename(&source, &target) {
+        return write_text_response(
+            stream,
+            "500 Internal Server Error",
+            &format!("Could not rename item: {error}\n"),
+            &[],
+            false,
+        );
+    }
+
+    write_text_response(stream, "204 No Content", "", &[], false)
+}
+
 fn handle_move_route(stream: &mut TcpStream, config: &Config, request: &Request) -> io::Result<()> {
     if request.method != "POST" {
         return write_text_response(
@@ -4302,6 +4415,8 @@ fn serve_directory(
         });
         body.push_str("\" data-can-symlink=\"");
         body.push_str(if !is_dir { "1" } else { "0" });
+        body.push_str("\" data-can-rename=\"");
+        body.push_str(if can_write_here { "1" } else { "0" });
         body.push_str("\" data-can-drag=\"");
         let can_drag = can_write_here && (!is_dir || is_symlink);
         body.push_str(if can_drag { "1" } else { "0" });
@@ -4434,6 +4549,7 @@ fn serve_directory(
     <a id="ctx-open" href="#">Open</a>
     <a id="ctx-download" href="#" download>Download</a>
     <button id="ctx-symlink" type="button">Symlink to this file…</button>
+    <button id="ctx-rename" type="button">Rename…</button>
     <button id="ctx-copy" type="button">Copy</button>
     <button id="ctx-cut" type="button">Cut</button>
     <button id="ctx-paste" type="button">Paste</button>
@@ -4446,7 +4562,7 @@ fn serve_directory(
     body.push_str(&folder_url_path);
     body.push_str("';const canWrite=");
     body.push_str(if can_write_here { "true" } else { "false" });
-    body.push_str(";const clipKey='splinterparty.clipboard';let clip=loadClip();let lastSelected=null;const rows=Array.from(document.querySelectorAll('.row.item'));const open=document.getElementById('ctx-open');const down=document.getElementById('ctx-download');const del=document.getElementById('ctx-delete');const sym=document.getElementById('ctx-symlink');const copy=document.getElementById('ctx-copy');const cut=document.getElementById('ctx-cut');const paste=document.getElementById('ctx-paste');const folder=document.getElementById('ctx-folder');function loadClip(){try{return JSON.parse(sessionStorage.getItem(clipKey)||'null');}catch(_){return null;}}function saveClip(value){clip=value;if(value){sessionStorage.setItem(clipKey,JSON.stringify(value));}else{sessionStorage.removeItem(clipKey);}}function hide(){menu.style.display='none';}function folderTarget(){if(current&&current.dataset.isDir==='1')return current.dataset.path;return currentFolder;}function canClip(row){return canWrite&&row&&row.dataset.canDrag==='1';}function selectedRows(){return rows.filter(row=>row.classList.contains('selected')&&canClip(row));}function operationRows(row){const selected=selectedRows();if(selected.length&&row&&row.classList.contains('selected'))return selected;if(canClip(row))return [row];return [];}function setSelected(row,on){if(!canClip(row))return;row.classList.toggle('selected',on);}function clearSelection(){rows.forEach(row=>row.classList.remove('selected'));}function selectRange(a,b){const start=rows.indexOf(a),end=rows.indexOf(b);if(start<0||end<0)return;const lo=Math.min(start,end),hi=Math.max(start,end);for(let i=lo;i<=hi;i++)setSelected(rows[i],true);}async function postTransfer(endpoint,source,destination,destinationPin){const body=new URLSearchParams({source:source,destination:destination});if(destinationPin)body.set('destination_pin',destinationPin);return fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});}async function transferMany(endpoint,sources,destination){let pin='';for(const source of sources){let resp=await postTransfer(endpoint,source,destination,pin);if(resp.status===403){const text=await resp.text();if(text.includes('Destination folder')){pin=prompt('Read+write PIN for the destination folder:')||'';if(!pin)return;resp=await postTransfer(endpoint,source,destination,pin);}else{alert(text||'Could not complete operation.');return;}}if(!(resp.ok||resp.status===204)){alert((await resp.text())||'Could not complete operation.');return;}}window.location.reload();}async function postDelete(path,pin){const body=new URLSearchParams({path:path});if(pin)body.set('pin',pin);return fetch('/__delete',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});}async function deleteMany(paths){if(!paths.length)return;if(!confirm('Delete '+paths.length+' selected items?'))return;let pin='';for(const path of paths){let resp=await postDelete(path,pin);if(resp.status===403){const text=await resp.text();if(text.includes('Read+write PIN')){pin=prompt('Read+write PIN:')||'';if(!pin)return;resp=await postDelete(path,pin);}else{alert(text||'Could not delete item.');return;}}if(!resp.ok){alert((await resp.text())||'Could not delete item.');return;}}window.location.reload();}function transfer(endpoint,source,destination){return transferMany(endpoint,[source],destination);}document.addEventListener('click',hide);document.addEventListener('keydown',e=>{if(e.key==='Escape')hide();});rows.forEach(row=>{row.addEventListener('click',e=>{if(!(e.ctrlKey||e.metaKey||e.shiftKey))return;e.preventDefault();if(e.shiftKey&&lastSelected){selectRange(lastSelected,row);}else{setSelected(row,!row.classList.contains('selected'));lastSelected=row;}});row.addEventListener('contextmenu',e=>{e.preventDefault();clip=loadClip();current=row;const path=row.dataset.path;const ops=operationRows(row);open.href=path;down.href=path;down.style.display=row.dataset.download==='1'?'block':'none';del.href='/__delete?path='+encodeURIComponent(row.dataset.deletePath||path);del.style.display=(row.dataset.delete==='1'||ops.length)?'block':'none';sym.style.display=row.dataset.canSymlink==='1'&&ops.length<=1?'block':'none';copy.style.display=ops.length?'block':'none';cut.style.display=ops.length?'block':'none';paste.style.display=canWrite&&clip?'block':'none';folder.style.display=canWrite?'block':'none';menu.style.left=Math.min(e.clientX,window.innerWidth-220)+'px';menu.style.top=Math.min(e.clientY,window.innerHeight-270)+'px';menu.style.display='block';});});sym.addEventListener('click',()=>{if(!current)return;hide();const target=current.dataset.path;const defaultName=current.dataset.name||'link';const name=prompt('Symlink name:', defaultName);if(!name)return;const params=new URLSearchParams({path:currentFolder,target_path:target,name:name});window.location.href='/__symlink?'+params.toString();});copy.addEventListener('click',()=>{const ops=operationRows(current);if(!ops.length)return;saveClip({paths:ops.map(row=>row.dataset.path),mode:'copy'});hide();});cut.addEventListener('click',()=>{const ops=operationRows(current);if(!ops.length)return;saveClip({paths:ops.map(row=>row.dataset.path),mode:'cut'});hide();});paste.addEventListener('click',()=>{clip=loadClip();if(!canWrite||!clip)return;const sources=clip.paths||[clip.path];const dest=folderTarget();const endpoint=clip.mode==='cut'?'/__move':'/__copy';if(clip.mode==='cut')saveClip(null);hide();transferMany(endpoint,sources,dest);});del.addEventListener('click',e=>{const ops=operationRows(current);if(ops.length<=1)return;e.preventDefault();hide();deleteMany(ops.map(row=>row.dataset.deletePath||row.dataset.path));});folder.addEventListener('click',()=>{hide();window.location.href='/__folder?path='+encodeURIComponent(folderTarget());});window.splinterTransferMany=transferMany;window.splinterSelectedSources=()=>selectedRows().map(row=>row.dataset.path);window.splinterTransfer=transfer;})();");
+    body.push_str(";const clipKey='splinterparty.clipboard';let clip=loadClip();let lastSelected=null;const rows=Array.from(document.querySelectorAll('.row.item'));const open=document.getElementById('ctx-open');const down=document.getElementById('ctx-download');const del=document.getElementById('ctx-delete');const sym=document.getElementById('ctx-symlink');const rename=document.getElementById('ctx-rename');const copy=document.getElementById('ctx-copy');const cut=document.getElementById('ctx-cut');const paste=document.getElementById('ctx-paste');const folder=document.getElementById('ctx-folder');function loadClip(){try{return JSON.parse(sessionStorage.getItem(clipKey)||'null');}catch(_){return null;}}function saveClip(value){clip=value;if(value){sessionStorage.setItem(clipKey,JSON.stringify(value));}else{sessionStorage.removeItem(clipKey);}}function hide(){menu.style.display='none';}function folderTarget(){if(current&&current.dataset.isDir==='1')return current.dataset.path;return currentFolder;}function canClip(row){return canWrite&&row&&row.dataset.canDrag==='1';}function selectedRows(){return rows.filter(row=>row.classList.contains('selected')&&canClip(row));}function operationRows(row){const selected=selectedRows();if(selected.length&&row&&row.classList.contains('selected'))return selected;if(canClip(row))return [row];return [];}function setSelected(row,on){if(!canClip(row))return;row.classList.toggle('selected',on);}function clearSelection(){rows.forEach(row=>row.classList.remove('selected'));}function selectRange(a,b){const start=rows.indexOf(a),end=rows.indexOf(b);if(start<0||end<0)return;const lo=Math.min(start,end),hi=Math.max(start,end);for(let i=lo;i<=hi;i++)setSelected(rows[i],true);}async function postTransfer(endpoint,source,destination,destinationPin){const body=new URLSearchParams({source:source,destination:destination});if(destinationPin)body.set('destination_pin',destinationPin);return fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});}async function transferMany(endpoint,sources,destination){let pin='';for(const source of sources){let resp=await postTransfer(endpoint,source,destination,pin);if(resp.status===403){const text=await resp.text();if(text.includes('Destination folder')){pin=prompt('Read+write PIN for the destination folder:')||'';if(!pin)return;resp=await postTransfer(endpoint,source,destination,pin);}else{alert(text||'Could not complete operation.');return;}}if(!(resp.ok||resp.status===204)){alert((await resp.text())||'Could not complete operation.');return;}}window.location.reload();}async function postDelete(path,pin){const body=new URLSearchParams({path:path});if(pin)body.set('pin',pin);return fetch('/__delete',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});}async function deleteMany(paths){if(!paths.length)return;if(!confirm('Delete '+paths.length+' selected items?'))return;let pin='';for(const path of paths){let resp=await postDelete(path,pin);if(resp.status===403){const text=await resp.text();if(text.includes('Read+write PIN')){pin=prompt('Read+write PIN:')||'';if(!pin)return;resp=await postDelete(path,pin);}else{alert(text||'Could not delete item.');return;}}if(!resp.ok){alert((await resp.text())||'Could not delete item.');return;}}window.location.reload();}async function postRename(path,name,pin){const body=new URLSearchParams({source:path,name:name});if(pin)body.set('pin',pin);return fetch('/__rename',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});}async function renameOne(row){if(!row||row.dataset.canRename!=='1')return;const oldName=row.dataset.name||'';const name=prompt('Rename to:',oldName);if(!name||name===oldName)return;let resp=await postRename(row.dataset.deletePath||row.dataset.path,name,'');if(resp.status===403){const text=await resp.text();if(text.includes('Read+write PIN')){const pin=prompt('Read+write PIN:')||'';if(!pin)return;resp=await postRename(row.dataset.deletePath||row.dataset.path,name,pin);}else{alert(text||'Could not rename item.');return;}}if(resp.ok||resp.status===204){window.location.reload();return;}alert((await resp.text())||'Could not rename item.');}function transfer(endpoint,source,destination){return transferMany(endpoint,[source],destination);}document.addEventListener('click',hide);document.addEventListener('keydown',e=>{if(e.key==='Escape')hide();});rows.forEach(row=>{row.addEventListener('click',e=>{if(!(e.ctrlKey||e.metaKey||e.shiftKey))return;e.preventDefault();if(e.shiftKey&&lastSelected){selectRange(lastSelected,row);}else{setSelected(row,!row.classList.contains('selected'));lastSelected=row;}});row.addEventListener('contextmenu',e=>{e.preventDefault();clip=loadClip();current=row;const path=row.dataset.path;const ops=operationRows(row);open.href=path;down.href=path;down.style.display=row.dataset.download==='1'?'block':'none';del.href='/__delete?path='+encodeURIComponent(row.dataset.deletePath||path);del.style.display=(row.dataset.delete==='1'||ops.length)?'block':'none';sym.style.display=row.dataset.canSymlink==='1'&&ops.length<=1?'block':'none';rename.style.display=row.dataset.canRename==='1'&&ops.length<=1?'block':'none';copy.style.display=ops.length?'block':'none';cut.style.display=ops.length?'block':'none';paste.style.display=canWrite&&clip?'block':'none';folder.style.display=canWrite?'block':'none';menu.style.left=Math.min(e.clientX,window.innerWidth-220)+'px';menu.style.top=Math.min(e.clientY,window.innerHeight-270)+'px';menu.style.display='block';});});sym.addEventListener('click',()=>{if(!current)return;hide();const target=current.dataset.path;const defaultName=current.dataset.name||'link';const name=prompt('Symlink name:', defaultName);if(!name)return;const params=new URLSearchParams({path:currentFolder,target_path:target,name:name});window.location.href='/__symlink?'+params.toString();});rename.addEventListener('click',()=>{hide();renameOne(current);});copy.addEventListener('click',()=>{const ops=operationRows(current);if(!ops.length)return;saveClip({paths:ops.map(row=>row.dataset.path),mode:'copy'});hide();});cut.addEventListener('click',()=>{const ops=operationRows(current);if(!ops.length)return;saveClip({paths:ops.map(row=>row.dataset.path),mode:'cut'});hide();});paste.addEventListener('click',()=>{clip=loadClip();if(!canWrite||!clip)return;const sources=clip.paths||[clip.path];const dest=folderTarget();const endpoint=clip.mode==='cut'?'/__move':'/__copy';if(clip.mode==='cut')saveClip(null);hide();transferMany(endpoint,sources,dest);});del.addEventListener('click',e=>{const ops=operationRows(current);if(ops.length<=1)return;e.preventDefault();hide();deleteMany(ops.map(row=>row.dataset.deletePath||row.dataset.path));});folder.addEventListener('click',()=>{hide();window.location.href='/__folder?path='+encodeURIComponent(folderTarget());});window.splinterTransferMany=transferMany;window.splinterSelectedSources=()=>selectedRows().map(row=>row.dataset.path);window.splinterTransfer=transfer;})();");
     body.push_str("</script>");
     body.push_str("<script>");
     body.push_str("(function(){let dragged=null;let dragSources=[];document.querySelectorAll('.row.item').forEach(row=>{if(row.dataset.canDrag==='1'){row.addEventListener('dragstart',e=>{dragged=row;dragSources=(window.splinterSelectedSources&&row.classList.contains('selected'))?window.splinterSelectedSources():[row.dataset.path];row.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',dragSources.join('\\n'));});row.addEventListener('dragend',()=>{row.classList.remove('dragging');dragged=null;dragSources=[];document.querySelectorAll('.drop-target').forEach(el=>el.classList.remove('drop-target'));});}if(row.dataset.dropTarget==='1'){row.addEventListener('dragover',e=>{if(!dragged||dragged===row)return;e.preventDefault();e.dataTransfer.dropEffect='move';row.classList.add('drop-target');});row.addEventListener('dragleave',()=>row.classList.remove('drop-target'));row.addEventListener('drop',e=>{if(!dragged||dragged===row)return;e.preventDefault();row.classList.remove('drop-target');const destination=row.dataset.path;if(window.splinterTransferMany)window.splinterTransferMany('/__move',dragSources,destination);});}});})();");
