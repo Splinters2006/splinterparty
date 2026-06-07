@@ -243,9 +243,69 @@ cmd_logs() {
     journalctl --user -u "$SERVICE_NAME" -f
 }
 
+cmd_tailscale() {
+    fail_if_root tailscale
+
+    echo "Enable Tailscale remote access? [y/N]"
+    read -r answer
+
+    case "$answer" in
+        y|Y|yes|YES)
+            ;;
+        *)
+            echo "Skipping Tailscale setup."
+            return 0
+            ;;
+    esac
+
+    if ! command -v tailscale >/dev/null 2>&1; then
+        echo "Tailscale is not installed."
+        echo "Installing Tailscale..."
+        curl -fsSL https://tailscale.com/install.sh | sh
+    fi
+
+    echo "Starting tailscaled..."
+    sudo systemctl enable --now tailscaled
+
+    echo
+    echo "Now logging into Tailscale."
+    echo "A login URL may appear. Open it and sign in."
+    sudo tailscale up
+
+    TS_IP="$(tailscale ip -4 2>/dev/null | head -n 1 || true)"
+
+    if [ -n "$TS_IP" ]; then
+        echo
+        echo "Tailscale remote access enabled:"
+        echo "  http://$TS_IP:8080"
+    else
+        echo "Tailscale was started, but no Tailscale IP was found."
+    fi
+}
+
+cmd_tailscale_status() {
+    fail_if_root tailscale-status
+
+    if ! command -v tailscale >/dev/null 2>&1; then
+        echo "Tailscale is not installed."
+        exit 1
+    fi
+
+    tailscale status || true
+
+    TS_IP="$(tailscale ip -4 2>/dev/null | head -n 1 || true)"
+
+    if [ -n "$TS_IP" ]; then
+        echo
+        echo "Splinterparty remote URL:"
+        echo "  http://$TS_IP:8080"
+    fi
+}
+
 cmd_all() {
     cmd_install
     cmd_setup
+    cmd_tailscale
     cmd_service_install
 }
 
@@ -269,10 +329,12 @@ case "${1:-}" in
     restart)         cmd_restart ;;
     status)          cmd_status ;;
     logs)            cmd_logs ;;
+    tailscale)       cmd_tailscale ;;
+    tailscale-status) cmd_tailscale_status ;;
     all)             cmd_all ;;
     update)          cmd_update ;;
     *)
-        echo "Usage: $0 {install|setup|service-install|remove|start|stop|restart|status|logs|all|update}"
+        echo "Usage: $0 {install|setup|service-install|remove|start|stop|restart|status|logs|tailscale|tailscale-status|all|update}"
         exit 1
         ;;
 esac
