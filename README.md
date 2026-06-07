@@ -47,6 +47,8 @@ File responses include weak ETags and support `If-None-Match`, so clients can av
 
 Directory pages render a built-in browser UI with item counts, file types, sizes, modified times, large-file labels, and download links.
 
+The browser UI can create protected folders and upload files from your device. Uploading into a protected folder requires that folder's read+write PIN.
+
 ## Commands
 
 ```bash
@@ -67,6 +69,16 @@ The `dedup` command scans a directory, groups files by size, hashes files that c
 The `split-large` command classifies files over 100 MiB as large files and splits them into 100 MiB parts. Each part gets its own SHA-256 hash in a `manifest.txt` file under `<filename>.parts/`.
 
 The `reassemble` command reads a split manifest, verifies every part hash and size, then rebuilds the original file.
+
+## Install
+
+Run:
+
+```bash
+./install.sh
+```
+
+The installer uses the system package manager when available to install build prerequisites, installs Rust through rustup if Cargo is missing, and builds the release binary.
 
 ## Port Forwarding
 

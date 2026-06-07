@@ -14,6 +14,8 @@ const CONFIG_FILE: &str = "splinterparty.conf";
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
 const LARGE_FILE_PART_SIZE: u64 = 100 * 1024 * 1024;
 const READ_BUF_SIZE: usize = 64 * 1024;
+const SHARE_FILE: &str = ".splinterparty.share";
+const PIN_COOKIE: &str = "sp_pin";
 const DIRECTORY_CSS: &str = r#"
 :root { color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f6f7f9; color: #171a1f; }
 * { box-sizing: border-box; }
@@ -25,7 +27,7 @@ h1 { margin: 0; font-size: 30px; line-height: 1.2; overflow-wrap: anywhere; }
 .summary { min-width: 88px; padding: 12px 14px; border: 1px solid #d9dee7; border-radius: 8px; background: #ffffff; text-align: right; }
 .summary span { display: block; font-size: 24px; font-weight: 750; }
 .summary small { color: #657386; }
-nav { margin: 0 0 12px; }
+nav { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; }
 a { color: #155eef; text-decoration: none; }
 a:hover { text-decoration: underline; }
 .up { display: inline-flex; align-items: center; min-height: 34px; padding: 0 12px; border: 1px solid #cbd5e1; border-radius: 8px; background: #ffffff; color: #1f2937; font-weight: 650; }
@@ -48,6 +50,17 @@ a:hover { text-decoration: underline; }
   .row.head { display: none; }
   .actions { text-align: left; }
 }
+"#;
+const FORM_CSS: &str = r#"
+.form-page { min-height: 100vh; display: grid; place-items: center; }
+.panel { width: min(460px, 100%); border: 1px solid #d9dee7; border-radius: 8px; background: #ffffff; padding: 22px; }
+.panel h1 { margin-bottom: 12px; font-size: 24px; }
+form { display: grid; gap: 14px; margin-top: 16px; }
+label { display: grid; gap: 6px; color: #1f2937; font-weight: 700; }
+label span, .muted { color: #657386; font-size: 13px; font-weight: 500; }
+input { width: 100%; min-height: 40px; border: 1px solid #cbd5e1; border-radius: 8px; padding: 8px 10px; font: inherit; }
+button { min-height: 42px; border: 0; border-radius: 8px; background: #155eef; color: #ffffff; font: inherit; font-weight: 750; cursor: pointer; }
+.error { border: 1px solid #fecaca; border-radius: 8px; background: #fff1f2; color: #991b1b; padding: 10px 12px; }
 "#;
 
 fn main() -> io::Result<()> {
@@ -1441,6 +1454,26 @@ fn handle_connection(mut stream: TcpStream, config: &Config) -> io::Result<()> {
         None => return Ok(()),
     };
 
+    if request.target.starts_with("/__pin") {
+        log_request(&peer, &request, "302");
+        return handle_pin_route(&mut stream, &request);
+    }
+
+    if request.target.starts_with("/__share") {
+        log_request(&peer, &request, "200");
+        return handle_share_route(&mut stream, config, &request);
+    }
+
+    if request.target.starts_with("/__folder") {
+        log_request(&peer, &request, "200");
+        return handle_folder_route(&mut stream, config, &request);
+    }
+
+    if request.target.starts_with("/__upload") {
+        log_request(&peer, &request, "200");
+        return handle_upload_route(&mut stream, config, &request);
+    }
+
     if request.method != "GET" && request.method != "HEAD" {
         log_request(&peer, &request, "405");
         return write_text_response(
@@ -1502,6 +1535,17 @@ fn handle_connection(mut stream: TcpStream, config: &Config) -> io::Result<()> {
         Err(error) => return Err(error),
     };
 
+    if path.file_name().is_some_and(|name| name == SHARE_FILE) {
+        log_request(&peer, &request, "404");
+        return write_text_response(
+            &mut stream,
+            "404 Not Found",
+            "Not found\n",
+            &[],
+            request.method == "HEAD",
+        );
+    }
+
     let metadata = match fs::metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -1516,6 +1560,20 @@ fn handle_connection(mut stream: TcpStream, config: &Config) -> io::Result<()> {
         }
         Err(error) => return Err(error),
     };
+
+    if let Some((_share_dir, share)) = find_applicable_share(&config.root, &path, &metadata)? {
+        let pin = request_pin(&request);
+        if !share.allows_read(pin.as_deref()) {
+            log_request(&peer, &request, "401");
+            return write_html_response(
+                &mut stream,
+                "401 Unauthorized",
+                &pin_prompt_html(&request.target, true),
+                &[("WWW-Authenticate", "PIN realm=\"Splinterparty\"")],
+                request.method == "HEAD",
+            );
+        }
+    }
 
     if metadata.is_dir() {
         log_request(&peer, &request, "200");
@@ -1555,6 +1613,7 @@ struct Request {
     method: String,
     target: String,
     headers: Vec<(String, String)>,
+    body: Vec<u8>,
 }
 
 impl Request {
@@ -1563,6 +1622,11 @@ impl Request {
             .iter()
             .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_str())
+    }
+
+    fn query_value(&self, name: &str) -> Option<String> {
+        let (_, query) = self.target.split_once('?')?;
+        form_value(query, name)
     }
 }
 
@@ -1655,10 +1719,21 @@ fn read_request(stream: &mut TcpStream) -> io::Result<Option<Request>> {
         }
     }
 
+    let content_length = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("Content-Length"))
+        .and_then(|(_, value)| value.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut body = vec![0_u8; content_length];
+    if content_length > 0 {
+        reader.read_exact(&mut body)?;
+    }
+
     Ok(Some(Request {
         method,
         target,
         headers,
+        body,
     }))
 }
 
@@ -1686,6 +1761,538 @@ fn is_authorized(request: &Request, auth: Option<&AuthConfig>) -> bool {
     };
 
     decoded == format!("{}:{}", auth.username, auth.password)
+}
+
+#[derive(Debug)]
+struct ShareConfig {
+    recovery_hash: String,
+    read_hash: Option<String>,
+    write_hash: String,
+}
+
+impl ShareConfig {
+    fn new(recovery: &str, read: Option<&str>, write: &str) -> Self {
+        Self {
+            recovery_hash: hash_pin(recovery),
+            read_hash: read.filter(|pin| !pin.is_empty()).map(hash_pin),
+            write_hash: hash_pin(write),
+        }
+    }
+
+    fn from_text(text: &str) -> io::Result<Self> {
+        let mut recovery_hash = None;
+        let mut read_hash = None;
+        let mut write_hash = None;
+
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            match key {
+                "recovery_hash" => recovery_hash = Some(value.to_string()),
+                "read_hash" => {
+                    if !value.is_empty() {
+                        read_hash = Some(value.to_string());
+                    }
+                }
+                "write_hash" => write_hash = Some(value.to_string()),
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            recovery_hash: recovery_hash.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "share missing recovery hash")
+            })?,
+            read_hash,
+            write_hash: write_hash.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "share missing write hash")
+            })?,
+        })
+    }
+
+    fn to_text(&self) -> String {
+        format!(
+            "version=1\nrecovery_hash={}\nread_hash={}\nwrite_hash={}\n",
+            self.recovery_hash,
+            self.read_hash.as_deref().unwrap_or(""),
+            self.write_hash
+        )
+    }
+
+    fn allows_read(&self, pin: Option<&str>) -> bool {
+        let Some(pin) = pin else {
+            return false;
+        };
+        let hash = hash_pin(pin);
+        self.read_hash.as_deref() == Some(hash.as_str()) || self.write_hash == hash
+    }
+
+    fn allows_write(&self, pin: Option<&str>) -> bool {
+        let Some(pin) = pin else {
+            return false;
+        };
+        self.write_hash == hash_pin(pin)
+    }
+
+    fn allows_recovery(&self, recovery: &str) -> bool {
+        self.recovery_hash == hash_pin(recovery)
+    }
+}
+
+fn hash_pin(pin: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(pin.as_bytes());
+    hex_bytes(&hasher.finish())
+}
+
+fn request_pin(request: &Request) -> Option<String> {
+    request
+        .query_value("pin")
+        .filter(|pin| !pin.is_empty())
+        .or_else(|| {
+            cookie_value(request.header("Cookie")?, PIN_COOKIE)
+                .and_then(|value| form_decode(value).ok())
+        })
+}
+
+fn cookie_value<'a>(header: &'a str, name: &str) -> Option<&'a str> {
+    header.split(';').find_map(|part| {
+        let (cookie_name, value) = part.trim().split_once('=')?;
+        if cookie_name == name {
+            Some(value)
+        } else {
+            None
+        }
+    })
+}
+
+fn find_applicable_share(
+    root: &Path,
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> io::Result<Option<(PathBuf, ShareConfig)>> {
+    let mut current = if metadata.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent().unwrap_or(root).to_path_buf()
+    };
+
+    loop {
+        let share_path = current.join(SHARE_FILE);
+        if share_path.exists() {
+            let share = ShareConfig::from_text(&fs::read_to_string(share_path)?)?;
+            return Ok(Some((current, share)));
+        }
+
+        if current == root {
+            return Ok(None);
+        }
+        if !current.pop() {
+            return Ok(None);
+        }
+    }
+}
+
+fn handle_pin_route(stream: &mut TcpStream, request: &Request) -> io::Result<()> {
+    if request.method == "GET" {
+        let path = request
+            .query_value("path")
+            .unwrap_or_else(|| "/".to_string());
+        return write_html_response(stream, "200 OK", &pin_prompt_html(&path, false), &[], false);
+    }
+
+    if request.method != "POST" {
+        return write_text_response(
+            stream,
+            "405 Method Not Allowed",
+            "Method not allowed\n",
+            &[("Allow", "GET, POST")],
+            false,
+        );
+    }
+
+    let form = String::from_utf8_lossy(&request.body);
+    let path = form_value(&form, "path").unwrap_or_else(|| "/".to_string());
+    let pin = form_value(&form, "pin").unwrap_or_default();
+    write_redirect_with_cookie(stream, &path, PIN_COOKIE, &pin)
+}
+
+fn handle_share_route(
+    stream: &mut TcpStream,
+    config: &Config,
+    request: &Request,
+) -> io::Result<()> {
+    if request.method == "GET" {
+        let path = request
+            .query_value("path")
+            .unwrap_or_else(|| "/".to_string());
+        let folder = folder_from_url_path(&config.root, &path)?;
+        let exists = folder.join(SHARE_FILE).exists();
+        return write_html_response(
+            stream,
+            "200 OK",
+            &share_form_html(&path, exists, None),
+            &[],
+            false,
+        );
+    }
+
+    if request.method != "POST" {
+        return write_text_response(
+            stream,
+            "405 Method Not Allowed",
+            "Method not allowed\n",
+            &[("Allow", "GET, POST")],
+            false,
+        );
+    }
+
+    let form = String::from_utf8_lossy(&request.body);
+    let path = form_value(&form, "path").unwrap_or_else(|| "/".to_string());
+    let recovery = form_value(&form, "recovery").unwrap_or_default();
+    let read_pin = form_value(&form, "read_pin").unwrap_or_default();
+    let write_pin = form_value(&form, "write_pin").unwrap_or_default();
+    let folder = folder_from_url_path(&config.root, &path)?;
+    let share_path = folder.join(SHARE_FILE);
+
+    if recovery.is_empty() || write_pin.is_empty() {
+        return write_html_response(
+            stream,
+            "400 Bad Request",
+            &share_form_html(
+                &path,
+                share_path.exists(),
+                Some("Recovery passcode and read+write PIN are required."),
+            ),
+            &[],
+            false,
+        );
+    }
+
+    if share_path.exists() {
+        let existing = ShareConfig::from_text(&fs::read_to_string(&share_path)?)?;
+        if !existing.allows_recovery(&recovery) {
+            return write_html_response(
+                stream,
+                "403 Forbidden",
+                &share_form_html(&path, true, Some("Recovery passcode is incorrect.")),
+                &[],
+                false,
+            );
+        }
+    }
+
+    let share = ShareConfig::new(
+        &recovery,
+        if read_pin.is_empty() {
+            None
+        } else {
+            Some(read_pin.as_str())
+        },
+        &write_pin,
+    );
+    fs::write(&share_path, share.to_text())?;
+    write_redirect_with_cookie(stream, &path, PIN_COOKIE, &write_pin)
+}
+
+fn handle_folder_route(
+    stream: &mut TcpStream,
+    config: &Config,
+    request: &Request,
+) -> io::Result<()> {
+    if request.method == "GET" {
+        let path = request
+            .query_value("path")
+            .unwrap_or_else(|| "/".to_string());
+        return write_html_response(stream, "200 OK", &folder_form_html(&path, None), &[], false);
+    }
+
+    if request.method != "POST" {
+        return write_text_response(
+            stream,
+            "405 Method Not Allowed",
+            "Method not allowed\n",
+            &[("Allow", "GET, POST")],
+            false,
+        );
+    }
+
+    let form = String::from_utf8_lossy(&request.body);
+    let parent_path = form_value(&form, "path").unwrap_or_else(|| "/".to_string());
+    let folder_name = form_value(&form, "name").unwrap_or_default();
+    let recovery = form_value(&form, "recovery").unwrap_or_default();
+    let read_pin = form_value(&form, "read_pin").unwrap_or_default();
+    let write_pin = form_value(&form, "write_pin").unwrap_or_default();
+    let parent_pin = form_value(&form, "parent_pin")
+        .filter(|pin| !pin.is_empty())
+        .or_else(|| request_pin(request));
+
+    if folder_name.is_empty() || recovery.is_empty() || write_pin.is_empty() {
+        return write_html_response(
+            stream,
+            "400 Bad Request",
+            &folder_form_html(
+                &parent_path,
+                Some("Folder name, recovery passcode, and read+write PIN are required."),
+            ),
+            &[],
+            false,
+        );
+    }
+
+    if !is_safe_folder_name(&folder_name) {
+        return write_html_response(
+            stream,
+            "400 Bad Request",
+            &folder_form_html(
+                &parent_path,
+                Some("Folder name cannot contain path separators."),
+            ),
+            &[],
+            false,
+        );
+    }
+
+    let parent = folder_from_url_path(&config.root, &parent_path)?;
+    let parent_metadata = fs::metadata(&parent)?;
+    if let Some((_share_dir, share)) =
+        find_applicable_share(&config.root, &parent, &parent_metadata)?
+    {
+        if !share.allows_write(parent_pin.as_deref()) {
+            return write_html_response(
+                stream,
+                "403 Forbidden",
+                &folder_form_html(
+                    &parent_path,
+                    Some("The parent folder requires its read+write PIN."),
+                ),
+                &[],
+                false,
+            );
+        }
+    }
+
+    let new_folder = parent.join(&folder_name);
+    fs::create_dir(&new_folder)?;
+    let share = ShareConfig::new(
+        &recovery,
+        if read_pin.is_empty() {
+            None
+        } else {
+            Some(read_pin.as_str())
+        },
+        &write_pin,
+    );
+    fs::write(new_folder.join(SHARE_FILE), share.to_text())?;
+
+    let new_path = format!(
+        "{}/{}",
+        parent_path.trim_end_matches('/'),
+        url_encode_path_segment(OsStr::new(&folder_name))
+    );
+    write_redirect_with_cookie(stream, &new_path, PIN_COOKIE, &write_pin)
+}
+
+fn handle_upload_route(
+    stream: &mut TcpStream,
+    config: &Config,
+    request: &Request,
+) -> io::Result<()> {
+    if request.method != "POST" {
+        return write_text_response(
+            stream,
+            "405 Method Not Allowed",
+            "Method not allowed\n",
+            &[("Allow", "POST")],
+            false,
+        );
+    }
+
+    let form = String::from_utf8_lossy(&request.body);
+    let path = form_value(&form, "path").unwrap_or_else(|| "/".to_string());
+    let filename = form_value(&form, "filename").unwrap_or_default();
+    let contents = form_value(&form, "contents").unwrap_or_default();
+    let pin = form_value(&form, "write_pin")
+        .filter(|pin| !pin.is_empty())
+        .or_else(|| request_pin(request));
+
+    if !is_safe_folder_name(&filename) {
+        return write_html_response(
+            stream,
+            "400 Bad Request",
+            &upload_error_html(&path, "Filename cannot be empty or contain path separators."),
+            &[],
+            false,
+        );
+    }
+
+    let folder = folder_from_url_path(&config.root, &path)?;
+    let metadata = fs::metadata(&folder)?;
+    if let Some((_share_dir, share)) = find_applicable_share(&config.root, &folder, &metadata)? {
+        if !share.allows_write(pin.as_deref()) {
+            return write_html_response(
+                stream,
+                "403 Forbidden",
+                &upload_error_html(&path, "This folder requires its read+write PIN to upload."),
+                &[],
+                false,
+            );
+        }
+    }
+
+    let target = folder.join(&filename);
+    if target.exists() {
+        return write_html_response(
+            stream,
+            "409 Conflict",
+            &upload_error_html(&path, "A file with that name already exists."),
+            &[],
+            false,
+        );
+    }
+
+    fs::write(&target, contents.as_bytes())?;
+    write_redirect_with_cookie(stream, &path, PIN_COOKIE, pin.as_deref().unwrap_or(""))
+}
+
+fn folder_from_url_path(root: &Path, url_path: &str) -> io::Result<PathBuf> {
+    let target = path_for_request(root, url_path)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid folder path"))?;
+    let folder = contained_path(root, &target)?;
+    if folder.is_dir() {
+        Ok(folder)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "share path must be a folder",
+        ))
+    }
+}
+
+fn url_path_for(root: &Path, path: &Path) -> String {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    if relative.as_os_str().is_empty() {
+        return "/".to_string();
+    }
+
+    let mut output = String::from("/");
+    for (index, component) in relative.components().enumerate() {
+        if index > 0 {
+            output.push('/');
+        }
+        if let Component::Normal(part) = component {
+            output.push_str(&url_encode_path_segment(part));
+        }
+    }
+    output
+}
+
+fn pin_prompt_html(path: &str, invalid: bool) -> String {
+    let mut body = String::new();
+    body.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Enter PIN</title><style>");
+    body.push_str(DIRECTORY_CSS);
+    body.push_str(FORM_CSS);
+    body.push_str("</style></head><body><main class=\"form-page\"><section class=\"panel\"><p class=\"eyebrow\">Splinterparty</p><h1>Enter folder PIN</h1>");
+    if invalid {
+        body.push_str("<p class=\"error\">PIN required or incorrect.</p>");
+    }
+    body.push_str(
+        "<form method=\"post\" action=\"/__pin\"><input type=\"hidden\" name=\"path\" value=\"",
+    );
+    body.push_str(&escape_html(path));
+    body.push_str("\"><label>PIN<input name=\"pin\" type=\"password\" autofocus required></label><button type=\"submit\">Open folder</button></form></section></main></body></html>");
+    body
+}
+
+fn share_form_html(path: &str, existing: bool, error: Option<&str>) -> String {
+    let mut body = String::new();
+    body.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Share settings</title><style>");
+    body.push_str(DIRECTORY_CSS);
+    body.push_str(FORM_CSS);
+    body.push_str("</style></head><body><main class=\"form-page\"><section class=\"panel\"><p class=\"eyebrow\">Splinterparty</p><h1>Share settings</h1><p class=\"muted\">");
+    body.push_str(&escape_html(path));
+    body.push_str("</p>");
+    if let Some(error) = error {
+        body.push_str("<p class=\"error\">");
+        body.push_str(&escape_html(error));
+        body.push_str("</p>");
+    }
+    body.push_str(
+        "<form method=\"post\" action=\"/__share\"><input type=\"hidden\" name=\"path\" value=\"",
+    );
+    body.push_str(&escape_html(path));
+    body.push_str("\"><label>Recovery passcode<input name=\"recovery\" type=\"password\" required></label><label>Read PIN <span>optional for sharing downloads</span><input name=\"read_pin\" type=\"password\"></label><label>Read+write PIN <span>required for owner access</span><input name=\"write_pin\" type=\"password\" required></label><button type=\"submit\">");
+    body.push_str(if existing {
+        "Change PINs"
+    } else {
+        "Create protected share"
+    });
+    body.push_str("</button></form><p class=\"muted\">Keep the recovery passcode. It is required to change these PINs later.</p></section></main></body></html>");
+    body
+}
+
+fn folder_form_html(path: &str, error: Option<&str>) -> String {
+    let mut body = String::new();
+    body.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>New folder</title><style>");
+    body.push_str(DIRECTORY_CSS);
+    body.push_str(FORM_CSS);
+    body.push_str("</style></head><body><main class=\"form-page\"><section class=\"panel\"><p class=\"eyebrow\">Splinterparty</p><h1>New protected folder</h1><p class=\"muted\">");
+    body.push_str(&escape_html(path));
+    body.push_str("</p>");
+    if let Some(error) = error {
+        body.push_str("<p class=\"error\">");
+        body.push_str(&escape_html(error));
+        body.push_str("</p>");
+    }
+    body.push_str(
+        "<form method=\"post\" action=\"/__folder\"><input type=\"hidden\" name=\"path\" value=\"",
+    );
+    body.push_str(&escape_html(path));
+    body.push_str("\"><label>Folder name<input name=\"name\" required></label><label>Parent read+write PIN <span>required when creating inside a protected folder</span><input name=\"parent_pin\" type=\"password\"></label><label>Recovery passcode<input name=\"recovery\" type=\"password\" required></label><label>Read PIN <span>optional for sharing downloads</span><input name=\"read_pin\" type=\"password\"></label><label>Read+write PIN <span>required for owner access</span><input name=\"write_pin\" type=\"password\" required></label><button type=\"submit\">Create folder</button></form><p class=\"muted\">The recovery passcode is required to change this folder's PINs later.</p></section></main></body></html>");
+    body
+}
+
+fn is_safe_folder_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && name != SHARE_FILE
+}
+
+fn form_value(input: &str, name: &str) -> Option<String> {
+    input.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if form_decode(key).ok()? == name {
+            form_decode(value).ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn form_decode(value: &str) -> io::Result<String> {
+    let replaced = value.replace('+', " ");
+    percent_decode(&replaced)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid form encoding"))
+}
+
+fn url_encode_query_value(value: &str) -> String {
+    value
+        .bytes()
+        .flat_map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                vec![byte as char]
+            }
+            byte => format!("%{byte:02X}").chars().collect(),
+        })
+        .collect()
 }
 
 fn path_for_request(root: &Path, target: &str) -> Option<PathBuf> {
@@ -1756,7 +2363,16 @@ fn serve_directory(
     path: &Path,
     skip_body: bool,
 ) -> io::Result<()> {
-    let mut entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
+    let mut entries = fs::read_dir(path)?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            if entry.file_name() == SHARE_FILE {
+                None
+            } else {
+                Some(Ok(entry))
+            }
+        })
+        .collect::<Result<Vec<_>, io::Error>>()?;
     entries.sort_by_key(|entry| {
         (
             entry.file_type().map(|kind| !kind.is_dir()).unwrap_or(true),
@@ -1787,9 +2403,16 @@ fn serve_directory(
     body.push_str(&entry_count.to_string());
     body.push_str("</span><small>items</small></div></header>");
 
+    body.push_str("<nav>");
     if !relative.as_os_str().is_empty() {
-        body.push_str("<nav><a class=\"up\" href=\"../\">Up one directory</a></nav>");
+        body.push_str("<a class=\"up\" href=\"../\">Up one directory</a>");
     }
+    body.push_str("<a class=\"up\" href=\"/__share?path=");
+    body.push_str(&url_encode_query_value(&url_path_for(root, path)));
+    body.push_str("\">Share settings</a>");
+    body.push_str("<a class=\"up\" href=\"/__folder?path=");
+    body.push_str(&url_encode_query_value(&url_path_for(root, path)));
+    body.push_str("\">New folder</a></nav>");
 
     body.push_str("<section class=\"browser\"><div class=\"row head\"><span>Name</span><span>Type</span><span>Size</span><span>Modified</span><span></span></div>");
 
@@ -1965,6 +2588,33 @@ fn write_text_response(
     Ok(())
 }
 
+fn write_html_response(
+    stream: &mut TcpStream,
+    status: &str,
+    body: &str,
+    headers: &[(&str, &str)],
+    skip_body: bool,
+) -> io::Result<()> {
+    let mut owned_headers = vec![("Content-Type", "text/html; charset=utf-8")];
+    owned_headers.extend_from_slice(headers);
+    write_text_response(stream, status, body, &owned_headers, skip_body)
+}
+
+fn write_redirect_with_cookie(
+    stream: &mut TcpStream,
+    location: &str,
+    cookie_name: &str,
+    cookie_value: &str,
+) -> io::Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 302 Found\r\nLocation: {}\r\nSet-Cookie: {}={}; Path=/; HttpOnly; SameSite=Lax\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        location,
+        cookie_name,
+        url_encode_query_value(cookie_value)
+    )
+}
+
 fn content_type(path: &Path) -> &'static str {
     match path.extension().and_then(OsStr::to_str) {
         Some("css") => "text/css; charset=utf-8",
@@ -2102,6 +2752,7 @@ mod tests {
                 "Authorization".to_string(),
                 "Basic c3BsaW50ZXI6c2VjcmV0".to_string(),
             )],
+            body: Vec::new(),
         };
         let auth = AuthConfig {
             username: "splinter".to_string(),
@@ -2121,6 +2772,7 @@ mod tests {
             method: "GET".to_string(),
             target: "/".to_string(),
             headers: Vec::new(),
+            body: Vec::new(),
         };
         let wrong = Request {
             method: "GET".to_string(),
@@ -2129,6 +2781,7 @@ mod tests {
                 "Authorization".to_string(),
                 "Basic c3BsaW50ZXI6d3Jvbmc=".to_string(),
             )],
+            body: Vec::new(),
         };
 
         assert!(!is_authorized(&missing, Some(&auth)));
@@ -2144,6 +2797,63 @@ mod tests {
         assert!(AuthConfig::from_parts(Some("admin".to_string()), None).is_none());
         assert!(AuthConfig::from_parts(None, Some("admin".to_string())).is_none());
         assert!(AuthConfig::from_parts(Some(String::new()), Some("admin".to_string())).is_none());
+    }
+
+    #[test]
+    fn share_config_allows_read_or_write_pin_but_not_recovery_for_reading() {
+        let share = ShareConfig::new("recover", Some("read"), "write");
+
+        assert!(share.allows_read(Some("read")));
+        assert!(share.allows_read(Some("write")));
+        assert!(!share.allows_read(Some("recover")));
+        assert!(share.allows_write(Some("write")));
+        assert!(!share.allows_write(Some("read")));
+        assert!(share.allows_recovery("recover"));
+    }
+
+    #[test]
+    fn share_config_round_trips_without_plaintext_pins() {
+        let share = ShareConfig::new("recover", Some("read"), "write");
+        let text = share.to_text();
+
+        assert!(!text.contains("=recover"));
+        assert!(!text.contains("=read"));
+        assert!(!text.contains("=write"));
+
+        let parsed = ShareConfig::from_text(&text).unwrap();
+        assert!(parsed.allows_read(Some("read")));
+        assert!(parsed.allows_recovery("recover"));
+    }
+
+    #[test]
+    fn request_pin_reads_query_or_cookie() {
+        let query = Request {
+            method: "GET".to_string(),
+            target: "/folder?pin=1234".to_string(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let cookie = Request {
+            method: "GET".to_string(),
+            target: "/folder".to_string(),
+            headers: vec![("Cookie".to_string(), "other=x; sp_pin=abcd".to_string())],
+            body: Vec::new(),
+        };
+
+        assert_eq!(request_pin(&query), Some("1234".to_string()));
+        assert_eq!(request_pin(&cookie), Some("abcd".to_string()));
+    }
+
+    #[test]
+    fn safe_folder_names_reject_path_tricks() {
+        assert!(is_safe_folder_name("photos"));
+        assert!(is_safe_folder_name("my folder"));
+        assert!(!is_safe_folder_name(""));
+        assert!(!is_safe_folder_name("."));
+        assert!(!is_safe_folder_name(".."));
+        assert!(!is_safe_folder_name("../outside"));
+        assert!(!is_safe_folder_name("nested/folder"));
+        assert!(!is_safe_folder_name(SHARE_FILE));
     }
 
     #[test]
