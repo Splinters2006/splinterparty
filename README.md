@@ -1,91 +1,149 @@
 # Splinterparty
 
-Splinterparty is a small Rust fileserver backend for serving a local directory or mounted partition over HTTP.
+Splinterparty is a lightweight Rust fileserver for sharing directories over HTTP with support for protected shares, uploads, downloads, resumable transfers, and optional UPnP port forwarding.
+
+## Features
+
+* Directory browser UI
+* File uploads from the browser
+* Protected shares with read-only and read/write PINs
+* File deletion support
+* Resumable downloads (HTTP Range requests)
+* ETag caching support
+* Duplicate file detection using SHA-256 hashes
+* Automatic filename conflict resolution
+* Optional UPnP port forwarding
+* Systemd user service support
+
+## Installation
+
+Clone the repository:
+
+```bash
+git clone https://github.com/Splinters2006/splinterparty.git
+cd splinterparty
+```
+
+Run the installer:
+
+```bash
+./splinterparty.sh all
+```
+
+Or perform the steps manually:
+
+```bash
+./splinterparty.sh install
+./splinterparty.sh setup
+./splinterparty.sh service-install
+```
+
+The installer:
+
+* Installs required build dependencies
+* Installs Rust if necessary
+* Builds Splinterparty in release mode
+* Installs the binary to:
+
+```bash
+~/.local/bin/splinterparty
+```
+
+## Service Management
+
+Check service status:
+
+```bash
+./splinterparty.sh status
+```
+
+View logs:
+
+```bash
+./splinterparty.sh logs
+```
+
+Restart the service:
+
+```bash
+./splinterparty.sh restart
+```
+
+Remove the service:
+
+```bash
+./splinterparty.sh service-remove
+```
+
+## Protected Shares
+
+A protected share can have:
+
+* Read PIN
+* Read + Write PIN
+
+Users with the read PIN can:
+
+* Browse files
+* Download files
+
+Users with the read + write PIN can:
+
+* Upload files
+* Delete files
+* Create folders
+
+Files outside protected shares can be deleted without entering a PIN.
+
+## Duplicate Files
+
+Files with identical names may coexist if their contents differ.
+
+Example:
+
+```text
+photo.jpg
+photo (1).jpg
+photo (2).jpg
+```
+
+When a file is uploaded:
+
+* Splinterparty computes its SHA-256 hash.
+* If a file with the same name already exists but has different content, a new numbered filename is generated automatically.
+* If a file with identical content already exists, the upload is rejected.
 
 ## Setup
-
-Run the interactive setup:
-
-```bash
-cargo run -- setup
-```
-
-Setup asks for:
-
-- the directory path to serve
-- the bind address, defaulting to `0.0.0.0:8080`
-- whether to configure router port forwarding through UPnP
-- whether to require username and password authentication
-
-The default username and password are both `admin`. Setup lets you change both values.
-
-Setup saves local machine settings in `splinterparty.conf`. That file is ignored by git because it contains machine-specific paths and credentials.
-
-## Run
-
-After setup:
-
-```bash
-cargo run
-```
-
-Serve a directory directly without using saved config:
-
-```bash
-cargo run -- /mnt/storage 0.0.0.0:8080
-```
-
-Serve directly and request UPnP port forwarding:
-
-```bash
-cargo run -- /mnt/storage 0.0.0.0:8080 --port-forward
-```
-
-Downloads support HTTP byte ranges, so browsers and media clients can resume downloads and seek within large files.
-
-File responses include weak ETags and support `If-None-Match`, so clients can avoid re-downloading unchanged files.
-
-Directory pages render a built-in browser UI with item counts, file types, sizes, modified times, large-file labels, and download links.
-
-The browser UI can create protected folders and upload files from your device. Files do not have their own PINs; uploading into a protected folder requires that directory to be unlocked with its read+write PIN.
-
-## Commands
-
-```bash
-cargo run -- --help
-cargo run -- config
-cargo run -- hash <file>
-cargo run -- dedup [root]
-cargo run -- split-large <file-or-directory>
-cargo run -- reassemble <manifest>
-```
-
-The `config` command prints the saved config summary but hides the password.
-
-The `hash` command prints a file's SHA-256 hash.
-
-The `dedup` command scans a directory, groups files by size, hashes files that could be duplicates, and reports duplicate groups. It does not delete or modify files.
-
-The `split-large` command classifies files over 100 MiB as large files and splits them into 100 MiB parts. Each part gets its own SHA-256 hash in a `manifest.txt` file under `<filename>.parts/`.
-
-The `reassemble` command reads a split manifest, verifies every part hash and size, then rebuilds the original file.
-
-## Install
 
 Run:
 
 ```bash
-./install.sh
+~/.local/bin/splinterparty setup
 ```
 
-The installer uses the system package manager when available to install build prerequisites, installs Rust through rustup if Cargo is missing, and builds the release binary.
+Setup asks for:
 
-## Port Forwarding
+* Directory to serve
+* Bind address
+* UPnP port forwarding
+* Authentication settings
 
-Automatic port forwarding is best effort. It only works when the network router supports UPnP IGD and allows `AddPortMapping` requests. If the router rejects the request or UPnP is disabled, configure the router manually.
+Configuration is stored in:
+
+```bash
+splinterparty.conf
+```
 
 ## Security
 
-When serving outside your own machine, keep authentication enabled and change the default credentials during setup.
+* Directory traversal attacks are blocked.
+* Symlink escapes outside the shared root are prevented.
+* Protected shares require PIN authentication.
+* Write operations require the read/write PIN.
+* Authentication can be enabled for the entire server.
 
-Requests are resolved and checked against the served root, so `..` paths and symlinks cannot be used to escape into the rest of the filesystem.
+## Port Forwarding
+
+UPnP port forwarding is best effort.
+
+If your router does not support UPnP or rejects requests, configure port forwarding manually.
