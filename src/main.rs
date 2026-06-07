@@ -1,15 +1,80 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsStr;
+use std::fmt::Write as _;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8080";
+const CONFIG_FILE: &str = "splinterparty.conf";
+const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
+const LARGE_FILE_PART_SIZE: u64 = 100 * 1024 * 1024;
 const READ_BUF_SIZE: usize = 64 * 1024;
+const DIRECTORY_CSS: &str = r#"
+:root { color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f6f7f9; color: #171a1f; }
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; background: #f6f7f9; }
+main { width: min(1120px, calc(100vw - 32px)); margin: 0 auto; padding: 32px 0; }
+header { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; margin-bottom: 18px; }
+.eyebrow { margin: 0 0 6px; font-size: 12px; font-weight: 700; letter-spacing: 0; text-transform: uppercase; color: #53606f; }
+h1 { margin: 0; font-size: 30px; line-height: 1.2; overflow-wrap: anywhere; }
+.summary { min-width: 88px; padding: 12px 14px; border: 1px solid #d9dee7; border-radius: 8px; background: #ffffff; text-align: right; }
+.summary span { display: block; font-size: 24px; font-weight: 750; }
+.summary small { color: #657386; }
+nav { margin: 0 0 12px; }
+a { color: #155eef; text-decoration: none; }
+a:hover { text-decoration: underline; }
+.up { display: inline-flex; align-items: center; min-height: 34px; padding: 0 12px; border: 1px solid #cbd5e1; border-radius: 8px; background: #ffffff; color: #1f2937; font-weight: 650; }
+.browser { overflow: hidden; border: 1px solid #d9dee7; border-radius: 8px; background: #ffffff; }
+.row { display: grid; grid-template-columns: minmax(220px, 1fr) 120px 110px 160px 100px; gap: 14px; align-items: center; min-height: 52px; padding: 0 16px; border-top: 1px solid #edf0f4; }
+.row:first-child { border-top: 0; }
+.row.head { min-height: 38px; background: #f1f4f8; color: #53606f; font-size: 12px; font-weight: 750; text-transform: uppercase; }
+.name { display: inline-flex; align-items: center; gap: 10px; min-width: 0; color: #111827; font-weight: 650; overflow-wrap: anywhere; }
+.icon { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 42px; height: 24px; border-radius: 6px; background: #e7eefc; color: #174ea6; font-size: 10px; font-weight: 800; }
+.type { color: #53606f; }
+.type.large { color: #9a3412; font-weight: 750; }
+.actions { text-align: right; }
+.actions a { font-weight: 650; }
+.empty { padding: 28px 16px; color: #657386; }
+@media (max-width: 760px) {
+  main { width: min(100vw - 20px, 1120px); padding: 18px 0; }
+  header { align-items: stretch; flex-direction: column; }
+  .summary { text-align: left; }
+  .row { grid-template-columns: 1fr; gap: 4px; align-items: start; padding: 12px; }
+  .row.head { display: none; }
+  .actions { text-align: left; }
+}
+"#;
 
 fn main() -> io::Result<()> {
-    let config = Config::from_env()?;
+    let config = match Command::from_env()? {
+        Command::Help => return print_help(),
+        Command::Config => return print_config(),
+        Command::Hash(path) => return print_file_hash(&path),
+        Command::Dedup(root) => return print_duplicates(root.as_deref()),
+        Command::SplitLarge(path) => return split_large_path(&path),
+        Command::Reassemble(path) => return reassemble_from_manifest(&path),
+        Command::Setup => return run_setup(),
+        Command::Serve(config) => config,
+    };
+
+    if config.port_forward {
+        match PortForwarder::new(config.port()).and_then(|forwarder| forwarder.add_mapping()) {
+            Ok(mapping) => println!(
+                "port forwarding configured: {}:{} -> {}:{}",
+                mapping.gateway_name,
+                mapping.external_port,
+                mapping.local_addr,
+                mapping.internal_port
+            ),
+            Err(error) => eprintln!("port forwarding skipped: {error}"),
+        }
+    }
+
     let listener = TcpListener::bind(&config.bind_addr)?;
 
     println!(
@@ -18,12 +83,16 @@ fn main() -> io::Result<()> {
         config.bind_addr
     );
 
+    let config = Arc::new(config);
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                if let Err(error) = handle_connection(stream, &config.root) {
-                    eprintln!("request failed: {error}");
-                }
+                let config = Arc::clone(&config);
+                thread::spawn(move || {
+                    if let Err(error) = handle_connection(stream, &config) {
+                        eprintln!("request failed: {error}");
+                    }
+                });
             }
             Err(error) => eprintln!("connection failed: {error}"),
         }
@@ -35,17 +104,17 @@ fn main() -> io::Result<()> {
 struct Config {
     bind_addr: String,
     root: PathBuf,
+    port_forward: bool,
+    auth: Option<AuthConfig>,
 }
 
 impl Config {
-    fn from_env() -> io::Result<Self> {
-        let mut args = env::args().skip(1);
-        let root = args
-            .next()
-            .map(PathBuf::from)
-            .unwrap_or(env::current_dir()?);
-        let bind_addr = args.next().unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string());
-
+    fn new(
+        root: PathBuf,
+        bind_addr: String,
+        port_forward: bool,
+        auth: Option<AuthConfig>,
+    ) -> io::Result<Self> {
         let root = fs::canonicalize(root)?;
         if !root.is_dir() {
             return Err(io::Error::new(
@@ -54,17 +123,1326 @@ impl Config {
             ));
         }
 
-        Ok(Self { bind_addr, root })
+        Ok(Self {
+            bind_addr,
+            root,
+            port_forward,
+            auth,
+        })
+    }
+
+    fn from_file() -> io::Result<Option<Self>> {
+        let path = Path::new(CONFIG_FILE);
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        let contents = fs::read_to_string(path)?;
+        let mut root = None;
+        let mut bind_addr = None;
+        let mut port_forward = None;
+        let mut auth_username = None;
+        let mut auth_password = None;
+
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+
+            match key.trim() {
+                "root" => root = Some(PathBuf::from(value.trim())),
+                "bind_addr" => bind_addr = Some(value.trim().to_string()),
+                "port_forward" => port_forward = Some(parse_bool(value.trim())),
+                "auth_username" => auth_username = Some(value.trim().to_string()),
+                "auth_password" => auth_password = Some(value.trim().to_string()),
+                _ => {}
+            }
+        }
+
+        let Some(root) = root else {
+            return Ok(None);
+        };
+
+        Self::new(
+            root,
+            bind_addr.unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string()),
+            port_forward.unwrap_or(false),
+            AuthConfig::from_parts(auth_username, auth_password),
+        )
+        .map(Some)
+    }
+
+    fn save(&self) -> io::Result<()> {
+        let mut contents = format!(
+            "root={}\nbind_addr={}\nport_forward={}\n",
+            self.root.display(),
+            self.bind_addr,
+            self.port_forward
+        );
+        if let Some(auth) = &self.auth {
+            contents.push_str(&format!(
+                "auth_username={}\nauth_password={}\n",
+                auth.username, auth.password
+            ));
+        }
+        fs::write(CONFIG_FILE, contents)
+    }
+
+    fn port(&self) -> u16 {
+        self.bind_addr
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse().ok())
+            .unwrap_or(8080)
     }
 }
 
-fn handle_connection(mut stream: TcpStream, root: &Path) -> io::Result<()> {
+#[derive(Clone)]
+struct AuthConfig {
+    username: String,
+    password: String,
+}
+
+impl AuthConfig {
+    fn from_parts(username: Option<String>, password: Option<String>) -> Option<Self> {
+        match (username, password) {
+            (Some(username), Some(password)) if !username.is_empty() && !password.is_empty() => {
+                Some(Self { username, password })
+            }
+            _ => None,
+        }
+    }
+}
+
+enum Command {
+    Help,
+    Config,
+    Hash(PathBuf),
+    Dedup(Option<PathBuf>),
+    SplitLarge(PathBuf),
+    Reassemble(PathBuf),
+    Setup,
+    Serve(Config),
+}
+
+impl Command {
+    fn from_env() -> io::Result<Self> {
+        let args = env::args().skip(1).collect::<Vec<_>>();
+        match args.first().map(String::as_str) {
+            Some("-h" | "--help" | "help") => return Ok(Self::Help),
+            Some("config") => return Ok(Self::Config),
+            Some("hash") => {
+                let Some(path) = args.get(1) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "usage: cargo run -- hash <file>",
+                    ));
+                };
+                return Ok(Self::Hash(PathBuf::from(path)));
+            }
+            Some("dedup") => return Ok(Self::Dedup(args.get(1).map(PathBuf::from))),
+            Some("split-large") => {
+                let Some(path) = args.get(1) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "usage: cargo run -- split-large <file-or-directory>",
+                    ));
+                };
+                return Ok(Self::SplitLarge(PathBuf::from(path)));
+            }
+            Some("reassemble") => {
+                let Some(path) = args.get(1) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "usage: cargo run -- reassemble <manifest>",
+                    ));
+                };
+                return Ok(Self::Reassemble(PathBuf::from(path)));
+            }
+            Some("setup") => return Ok(Self::Setup),
+            _ => {}
+        }
+
+        let config = if args.is_empty() {
+            Config::from_file()?.unwrap_or(Config::new(
+                env::current_dir()?,
+                DEFAULT_BIND_ADDR.to_string(),
+                false,
+                None,
+            )?)
+        } else {
+            let root = PathBuf::from(&args[0]);
+            let bind_addr = args
+                .get(1)
+                .cloned()
+                .unwrap_or_else(|| DEFAULT_BIND_ADDR.to_string());
+            let port_forward = args.iter().any(|arg| arg == "--port-forward");
+            Config::new(root, bind_addr, port_forward, None)?
+        };
+
+        Ok(Self::Serve(config))
+    }
+}
+
+fn print_help() -> io::Result<()> {
+    println!(
+        "Splinterparty fileserver\n\n\
+         Usage:\n\
+           cargo run -- setup              Run interactive setup\n\
+           cargo run                       Serve using splinterparty.conf, or current directory if no config exists\n\
+           cargo run -- <root> [bind]      Serve a directory directly\n\
+           cargo run -- config             Show current saved config\n\
+           cargo run -- hash <file>        Print a file SHA-256 hash\n\
+           cargo run -- dedup [root]       Find duplicate files by SHA-256\n\
+           cargo run -- split-large <path> Split files over 100 MiB into hashed parts\n\
+           cargo run -- reassemble <file>  Reassemble a split-large manifest\n\
+           cargo run -- --help             Show this help\n\n\
+         Examples:\n\
+           cargo run -- setup\n\
+           cargo run\n\
+           cargo run -- /mnt/storage 0.0.0.0:8080 --port-forward\n\
+           cargo run -- hash /mnt/storage/photo.jpg\n\
+           cargo run -- dedup /mnt/storage\n\
+           cargo run -- split-large /mnt/storage/video.mp4\n\
+           cargo run -- reassemble /mnt/storage/video.mp4.parts/manifest.txt"
+    );
+    Ok(())
+}
+
+fn print_config() -> io::Result<()> {
+    match Config::from_file()? {
+        Some(config) => {
+            println!("config file: {CONFIG_FILE}");
+            println!("root: {}", config.root.display());
+            println!("bind address: {}", config.bind_addr);
+            println!("port forwarding: {}", enabled_label(config.port_forward));
+            match &config.auth {
+                Some(auth) => {
+                    println!("auth: enabled");
+                    println!("auth username: {}", auth.username);
+                    println!("auth password: hidden");
+                }
+                None => println!("auth: disabled"),
+            }
+        }
+        None => {
+            println!("no {CONFIG_FILE} found");
+            println!("run `cargo run -- setup` to create one");
+        }
+    }
+
+    Ok(())
+}
+
+fn enabled_label(enabled: bool) -> &'static str {
+    if enabled { "enabled" } else { "disabled" }
+}
+
+fn print_file_hash(path: &Path) -> io::Result<()> {
+    let hash = hash_file(path)?;
+    println!("{}  {}", hash, path.display());
+    Ok(())
+}
+
+fn print_duplicates(root: Option<&Path>) -> io::Result<()> {
+    let root = match root {
+        Some(root) => fs::canonicalize(root)?,
+        None => Config::from_file()?
+            .map(|config| config.root)
+            .unwrap_or(env::current_dir()?),
+    };
+
+    let report = find_duplicates(&root)?;
+    if report.groups.is_empty() {
+        println!("no duplicate files found under {}", root.display());
+        return Ok(());
+    }
+
+    println!(
+        "found {} duplicate groups under {}",
+        report.groups.len(),
+        root.display()
+    );
+    println!("duplicate bytes: {}", human_bytes(report.duplicate_bytes));
+
+    for (index, group) in report.groups.iter().enumerate() {
+        println!(
+            "\n{}. {} files, {}, sha256 {}",
+            index + 1,
+            group.paths.len(),
+            human_bytes(group.size),
+            group.hash
+        );
+        for path in &group.paths {
+            println!("   {}", path.display());
+        }
+    }
+
+    Ok(())
+}
+
+fn split_large_path(path: &Path) -> io::Result<()> {
+    let metadata = fs::metadata(path)?;
+    if metadata.is_file() {
+        split_large_file(path)?;
+        return Ok(());
+    }
+
+    if metadata.is_dir() {
+        let mut files_by_size = BTreeMap::<u64, Vec<PathBuf>>::new();
+        collect_files_by_size(path, &mut files_by_size)?;
+        let mut split_count = 0_u64;
+
+        for (size, paths) in files_by_size {
+            if size <= LARGE_FILE_PART_SIZE {
+                continue;
+            }
+
+            for path in paths {
+                split_large_file(&path)?;
+                split_count += 1;
+            }
+        }
+
+        println!("split {split_count} large files under {}", path.display());
+        return Ok(());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "split-large path must be a file or directory",
+    ))
+}
+
+fn split_large_file(path: &Path) -> io::Result<()> {
+    let metadata = fs::metadata(path)?;
+    if metadata.len() <= LARGE_FILE_PART_SIZE {
+        println!(
+            "not a large file: {} is {}",
+            path.display(),
+            human_bytes(metadata.len())
+        );
+        return Ok(());
+    }
+
+    let file_name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid file name"))?;
+    let parts_dir = path.with_file_name(format!("{file_name}.parts"));
+    fs::create_dir_all(&parts_dir)?;
+
+    let mut source = File::open(path)?;
+    let mut manifest = SplitManifest {
+        original_name: file_name.to_string(),
+        original_size: metadata.len(),
+        part_size: LARGE_FILE_PART_SIZE,
+        parts: Vec::new(),
+    };
+
+    let mut index = 0_u64;
+    loop {
+        let part_path = parts_dir.join(format!("{index:08}.part"));
+        let mut part_file = File::create(&part_path)?;
+        let mut hasher = Sha256::new();
+        let mut written = 0_u64;
+        let mut buffer = [0_u8; READ_BUF_SIZE];
+
+        while written < LARGE_FILE_PART_SIZE {
+            let read_len = buffer.len().min((LARGE_FILE_PART_SIZE - written) as usize);
+            let bytes_read = source.read(&mut buffer[..read_len])?;
+            if bytes_read == 0 {
+                break;
+            }
+
+            part_file.write_all(&buffer[..bytes_read])?;
+            hasher.update(&buffer[..bytes_read]);
+            written += bytes_read as u64;
+        }
+
+        if written == 0 {
+            let _ = fs::remove_file(part_path);
+            break;
+        }
+
+        manifest.parts.push(SplitPart {
+            index,
+            file_name: format!("{index:08}.part"),
+            size: written,
+            sha256: hex_bytes(&hasher.finish()),
+        });
+        index += 1;
+    }
+
+    let manifest_path = parts_dir.join("manifest.txt");
+    fs::write(&manifest_path, manifest.to_text())?;
+
+    println!(
+        "split {} into {} parts at {}",
+        path.display(),
+        manifest.parts.len(),
+        parts_dir.display()
+    );
+    println!("manifest: {}", manifest_path.display());
+    Ok(())
+}
+
+#[derive(Debug)]
+struct SplitManifest {
+    original_name: String,
+    original_size: u64,
+    part_size: u64,
+    parts: Vec<SplitPart>,
+}
+
+#[derive(Debug)]
+struct SplitPart {
+    index: u64,
+    file_name: String,
+    size: u64,
+    sha256: String,
+}
+
+impl SplitManifest {
+    fn to_text(&self) -> String {
+        let mut output = String::new();
+        let _ = writeln!(output, "version=1");
+        let _ = writeln!(output, "original_name={}", self.original_name);
+        let _ = writeln!(output, "original_size={}", self.original_size);
+        let _ = writeln!(output, "part_size={}", self.part_size);
+        for part in &self.parts {
+            let _ = writeln!(
+                output,
+                "part={},{},{},{}",
+                part.index, part.file_name, part.size, part.sha256
+            );
+        }
+        output
+    }
+
+    fn from_text(text: &str) -> io::Result<Self> {
+        let mut original_name = None;
+        let mut original_size = None;
+        let mut part_size = None;
+        let mut parts = Vec::new();
+
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            match key {
+                "version" => {
+                    if value != "1" {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "unsupported split manifest version",
+                        ));
+                    }
+                }
+                "original_name" => original_name = Some(value.to_string()),
+                "original_size" => original_size = value.parse().ok(),
+                "part_size" => part_size = value.parse().ok(),
+                "part" => {
+                    let fields = value.split(',').collect::<Vec<_>>();
+                    if fields.len() != 4 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid part manifest line",
+                        ));
+                    }
+                    parts.push(SplitPart {
+                        index: fields[0].parse().map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidData, "invalid part index")
+                        })?,
+                        file_name: fields[1].to_string(),
+                        size: fields[2].parse().map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidData, "invalid part size")
+                        })?,
+                        sha256: fields[3].to_string(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            original_name: original_name.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "manifest missing original_name")
+            })?,
+            original_size: original_size.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "manifest missing original_size")
+            })?,
+            part_size: part_size.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "manifest missing part_size")
+            })?,
+            parts,
+        })
+    }
+}
+
+fn reassemble_from_manifest(manifest_path: &Path) -> io::Result<()> {
+    let manifest_text = fs::read_to_string(manifest_path)?;
+    let manifest = SplitManifest::from_text(&manifest_text)?;
+    let parts_dir = manifest_path.parent().unwrap_or(Path::new("."));
+    let output_path = parts_dir.with_file_name(&manifest.original_name);
+    let temp_output_path =
+        parts_dir.with_file_name(format!("{}.reassembling", manifest.original_name));
+
+    let mut output = File::create(&temp_output_path)?;
+    let mut total_written = 0_u64;
+
+    for part in &manifest.parts {
+        let part_path = parts_dir.join(&part.file_name);
+        let actual_hash = hash_file(&part_path)?;
+        if actual_hash != part.sha256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "part {} hash mismatch: expected {}, got {}",
+                    part.file_name, part.sha256, actual_hash
+                ),
+            ));
+        }
+
+        let metadata = fs::metadata(&part_path)?;
+        if metadata.len() != part.size {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "part {} size mismatch: expected {}, got {}",
+                    part.file_name,
+                    part.size,
+                    metadata.len()
+                ),
+            ));
+        }
+
+        let mut input = File::open(&part_path)?;
+        io::copy(&mut input, &mut output)?;
+        total_written += part.size;
+    }
+
+    if total_written != manifest.original_size {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "reassembled size mismatch: expected {}, got {}",
+                manifest.original_size, total_written
+            ),
+        ));
+    }
+
+    fs::rename(&temp_output_path, &output_path)?;
+    println!("reassembled {}", output_path.display());
+    Ok(())
+}
+
+struct DedupReport {
+    groups: Vec<DuplicateGroup>,
+    duplicate_bytes: u64,
+}
+
+struct DuplicateGroup {
+    size: u64,
+    hash: String,
+    paths: Vec<PathBuf>,
+}
+
+fn find_duplicates(root: &Path) -> io::Result<DedupReport> {
+    let mut files_by_size = BTreeMap::<u64, Vec<PathBuf>>::new();
+    collect_files_by_size(root, &mut files_by_size)?;
+
+    let mut groups = Vec::new();
+    for (size, paths) in files_by_size {
+        if paths.len() < 2 {
+            continue;
+        }
+
+        let mut paths_by_hash = BTreeMap::<String, Vec<PathBuf>>::new();
+        for path in paths {
+            let hash = hash_file(&path)?;
+            paths_by_hash.entry(hash).or_default().push(path);
+        }
+
+        for (hash, paths) in paths_by_hash {
+            if paths.len() > 1 {
+                groups.push(DuplicateGroup { size, hash, paths });
+            }
+        }
+    }
+
+    let duplicate_bytes = groups
+        .iter()
+        .map(|group| group.size * group.paths.len().saturating_sub(1) as u64)
+        .sum();
+
+    Ok(DedupReport {
+        groups,
+        duplicate_bytes,
+    })
+}
+
+fn collect_files_by_size(
+    root: &Path,
+    files_by_size: &mut BTreeMap<u64, Vec<PathBuf>>,
+) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(root)?;
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+
+    if metadata.is_file() {
+        files_by_size
+            .entry(metadata.len())
+            .or_default()
+            .push(root.to_path_buf());
+        return Ok(());
+    }
+
+    if metadata.is_dir() {
+        for entry in fs::read_dir(root)? {
+            collect_files_by_size(&entry?.path(), files_by_size)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn hash_file(path: &Path) -> io::Result<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; READ_BUF_SIZE];
+
+    loop {
+        let bytes_read = file.read(&mut buffer)?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+
+    Ok(hex_bytes(&hasher.finish()))
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.2} {}", UNITS[unit])
+    }
+}
+
+fn system_time_label(time: SystemTime) -> Option<String> {
+    let seconds = time.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some(format_unix_seconds(seconds))
+}
+
+fn format_unix_seconds(seconds: u64) -> String {
+    let days = seconds / 86_400;
+    let seconds_of_day = seconds % 86_400;
+    let (year, month, day) = civil_from_days(days as i64);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
+}
+
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    let year = y + if month <= 2 { 1 } else { 0 };
+
+    (year, month as u32, day as u32)
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+struct Sha256 {
+    state: [u32; 8],
+    buffer: [u8; 64],
+    buffer_len: usize,
+    message_len: u64,
+}
+
+impl Sha256 {
+    fn new() -> Self {
+        Self {
+            state: [
+                0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            buffer: [0; 64],
+            buffer_len: 0,
+            message_len: 0,
+        }
+    }
+
+    fn update(&mut self, mut input: &[u8]) {
+        self.message_len = self.message_len.wrapping_add(input.len() as u64);
+
+        if self.buffer_len > 0 {
+            let fill = (64 - self.buffer_len).min(input.len());
+            self.buffer[self.buffer_len..self.buffer_len + fill].copy_from_slice(&input[..fill]);
+            self.buffer_len += fill;
+            input = &input[fill..];
+
+            if self.buffer_len == 64 {
+                let block = self.buffer;
+                self.compress(&block);
+                self.buffer_len = 0;
+            }
+        }
+
+        while input.len() >= 64 {
+            self.compress(&input[..64]);
+            input = &input[64..];
+        }
+
+        if !input.is_empty() {
+            self.buffer[..input.len()].copy_from_slice(input);
+            self.buffer_len = input.len();
+        }
+    }
+
+    fn finish(mut self) -> [u8; 32] {
+        let bit_len = self.message_len.wrapping_mul(8);
+
+        self.buffer[self.buffer_len] = 0x80;
+        self.buffer_len += 1;
+
+        if self.buffer_len > 56 {
+            self.buffer[self.buffer_len..].fill(0);
+            let block = self.buffer;
+            self.compress(&block);
+            self.buffer_len = 0;
+        }
+
+        self.buffer[self.buffer_len..56].fill(0);
+        self.buffer[56..64].copy_from_slice(&bit_len.to_be_bytes());
+        let block = self.buffer;
+        self.compress(&block);
+
+        let mut output = [0_u8; 32];
+        for (index, word) in self.state.iter().enumerate() {
+            output[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        output
+    }
+
+    fn compress(&mut self, block: &[u8]) {
+        const K: [u32; 64] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+            0xc67178f2,
+        ];
+
+        let mut w = [0_u32; 64];
+        for index in 0..16 {
+            let offset = index * 4;
+            w[index] = u32::from_be_bytes([
+                block[offset],
+                block[offset + 1],
+                block[offset + 2],
+                block[offset + 3],
+            ]);
+        }
+
+        for index in 16..64 {
+            let s0 = w[index - 15].rotate_right(7)
+                ^ w[index - 15].rotate_right(18)
+                ^ (w[index - 15] >> 3);
+            let s1 = w[index - 2].rotate_right(17)
+                ^ w[index - 2].rotate_right(19)
+                ^ (w[index - 2] >> 10);
+            w[index] = w[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[index - 7])
+                .wrapping_add(s1);
+        }
+
+        let mut a = self.state[0];
+        let mut b = self.state[1];
+        let mut c = self.state[2];
+        let mut d = self.state[3];
+        let mut e = self.state[4];
+        let mut f = self.state[5];
+        let mut g = self.state[6];
+        let mut h = self.state[7];
+
+        for index in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[index])
+                .wrapping_add(w[index]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+
+        self.state[0] = self.state[0].wrapping_add(a);
+        self.state[1] = self.state[1].wrapping_add(b);
+        self.state[2] = self.state[2].wrapping_add(c);
+        self.state[3] = self.state[3].wrapping_add(d);
+        self.state[4] = self.state[4].wrapping_add(e);
+        self.state[5] = self.state[5].wrapping_add(f);
+        self.state[6] = self.state[6].wrapping_add(g);
+        self.state[7] = self.state[7].wrapping_add(h);
+    }
+}
+
+fn run_setup() -> io::Result<()> {
+    println!("Splinterparty setup");
+
+    let root = prompt_served_root()?;
+    let default_bind = DEFAULT_BIND_ADDR.to_string();
+    let bind_addr = prompt_string("Bind address", &default_bind)?;
+    let port_forward = prompt_bool("Configure router port forwarding with UPnP", true)?;
+    let auth = prompt_auth_config()?;
+
+    let config = Config::new(root, bind_addr, port_forward, auth)?;
+    config.save()?;
+
+    println!("saved {CONFIG_FILE}");
+    if let Some(auth) = &config.auth {
+        println!("auth username: {}", auth.username);
+        println!("auth password: {}", auth.password);
+    }
+
+    if config.port_forward {
+        match PortForwarder::new(config.port()).and_then(|forwarder| forwarder.add_mapping()) {
+            Ok(mapping) => println!(
+                "port forwarding configured: {}:{} -> {}:{}",
+                mapping.gateway_name,
+                mapping.external_port,
+                mapping.local_addr,
+                mapping.internal_port
+            ),
+            Err(error) => eprintln!("port forwarding failed: {error}"),
+        }
+    }
+
+    println!("run `cargo run` to start serving {}", config.root.display());
+    Ok(())
+}
+
+fn prompt_auth_config() -> io::Result<Option<AuthConfig>> {
+    if !prompt_bool("Require username and password", true)? {
+        return Ok(None);
+    }
+
+    let username = prompt_string("Username", "admin")?;
+    let password = prompt_string("Password", "admin")?;
+
+    Ok(Some(AuthConfig { username, password }))
+}
+
+fn prompt_served_root() -> io::Result<PathBuf> {
+    let default_root = env::current_dir()?;
+    let mounts = mount_points();
+
+    if !mounts.is_empty() {
+        println!("Detected mount points:");
+        for (index, mount) in mounts.iter().enumerate() {
+            println!("  {}. {}", index + 1, mount.display());
+        }
+    }
+
+    loop {
+        let value = prompt_string(
+            "Directory, mount point number, or mounted partition to serve",
+            &default_root.display().to_string(),
+        )?;
+
+        if let Ok(index) = value.parse::<usize>() {
+            if let Some(mount) = mounts.get(index.saturating_sub(1)) {
+                return Ok(mount.clone());
+            }
+            println!("please choose one of the listed mount point numbers");
+            continue;
+        }
+
+        return Ok(PathBuf::from(value));
+    }
+}
+
+fn prompt_string(label: &str, default: &str) -> io::Result<String> {
+    if default.is_empty() {
+        print!("{label}: ");
+    } else {
+        print!("{label} [{default}]: ");
+    }
+    io::stdout().flush()?;
+
+    let mut value = String::new();
+    io::stdin().read_line(&mut value)?;
+    let value = value.trim();
+
+    if value.is_empty() {
+        Ok(default.to_string())
+    } else {
+        Ok(value.to_string())
+    }
+}
+
+fn prompt_bool(label: &str, default: bool) -> io::Result<bool> {
+    let hint = if default { "Y/n" } else { "y/N" };
+    loop {
+        print!("{label} ({hint}): ");
+        io::stdout().flush()?;
+
+        let mut value = String::new();
+        io::stdin().read_line(&mut value)?;
+        let value = value.trim();
+
+        if value.is_empty() {
+            return Ok(default);
+        }
+
+        match value.to_ascii_lowercase().as_str() {
+            "y" | "yes" | "true" | "1" => return Ok(true),
+            "n" | "no" | "false" | "0" => return Ok(false),
+            _ => println!("please answer yes or no"),
+        }
+    }
+}
+
+fn parse_bool(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "true" | "yes" | "1" | "on"
+    )
+}
+
+fn base64_decode(value: &str) -> Option<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut chunk = [0_u8; 4];
+    let mut chunk_len = 0;
+
+    for byte in value.bytes().filter(|byte| !byte.is_ascii_whitespace()) {
+        let decoded = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => 64,
+            _ => return None,
+        };
+
+        chunk[chunk_len] = decoded;
+        chunk_len += 1;
+
+        if chunk_len == 4 {
+            if chunk[0] == 64 || chunk[1] == 64 {
+                return None;
+            }
+
+            output.push((chunk[0] << 2) | (chunk[1] >> 4));
+            if chunk[2] != 64 {
+                output.push((chunk[1] << 4) | (chunk[2] >> 2));
+            }
+            if chunk[3] != 64 {
+                output.push((chunk[2] << 6) | chunk[3]);
+            }
+
+            chunk_len = 0;
+        }
+    }
+
+    if chunk_len == 0 { Some(output) } else { None }
+}
+
+fn mount_points() -> Vec<PathBuf> {
+    let Ok(contents) = fs::read_to_string("/proc/mounts") else {
+        return Vec::new();
+    };
+
+    let mut mounts = contents
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let _device = parts.next()?;
+            let mount = decode_mount_path(parts.next()?);
+            let fs_type = parts.next()?;
+
+            if should_show_mount(&mount, fs_type) {
+                Some(PathBuf::from(mount))
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+
+    mounts.sort();
+    mounts.dedup();
+    mounts
+}
+
+fn should_show_mount(mount: &str, fs_type: &str) -> bool {
+    if matches!(
+        fs_type,
+        "autofs"
+            | "binfmt_misc"
+            | "cgroup"
+            | "cgroup2"
+            | "configfs"
+            | "debugfs"
+            | "devpts"
+            | "devtmpfs"
+            | "fusectl"
+            | "hugetlbfs"
+            | "mqueue"
+            | "proc"
+            | "pstore"
+            | "securityfs"
+            | "sysfs"
+            | "tmpfs"
+            | "tracefs"
+    ) {
+        return false;
+    }
+
+    mount == "/"
+        || mount.starts_with("/home")
+        || mount.starts_with("/media")
+        || mount.starts_with("/mnt")
+}
+
+fn decode_mount_path(value: &str) -> String {
+    value
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+struct PortForwarder {
+    internal_port: u16,
+    external_port: u16,
+    local_addr: String,
+}
+
+impl PortForwarder {
+    fn new(port: u16) -> io::Result<Self> {
+        Ok(Self {
+            internal_port: port,
+            external_port: port,
+            local_addr: local_lan_addr()?,
+        })
+    }
+
+    fn add_mapping(&self) -> io::Result<PortMapping> {
+        let gateway = discover_gateway()?;
+        let description = http_get(&gateway.description_url)?;
+        let service = find_wan_service(&description, &gateway.description_url)?;
+
+        let body = format!(
+            "<?xml version=\"1.0\"?>\
+             <s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
+             <s:Body>\
+             <u:AddPortMapping xmlns:u=\"{}\">\
+             <NewRemoteHost></NewRemoteHost>\
+             <NewExternalPort>{}</NewExternalPort>\
+             <NewProtocol>TCP</NewProtocol>\
+             <NewInternalPort>{}</NewInternalPort>\
+             <NewInternalClient>{}</NewInternalClient>\
+             <NewEnabled>1</NewEnabled>\
+             <NewPortMappingDescription>splinterparty fileserver</NewPortMappingDescription>\
+             <NewLeaseDuration>0</NewLeaseDuration>\
+             </u:AddPortMapping>\
+             </s:Body>\
+             </s:Envelope>",
+            service.service_type, self.external_port, self.internal_port, self.local_addr
+        );
+
+        let response = http_post(
+            &service.control_url,
+            &format!("{}#AddPortMapping", service.service_type),
+            &body,
+        )?;
+
+        if !response.starts_with("HTTP/1.1 200") && !response.starts_with("HTTP/1.0 200") {
+            let status = response.lines().next().unwrap_or("unknown response");
+            return Err(io::Error::other(format!(
+                "gateway rejected AddPortMapping: {status}"
+            )));
+        }
+
+        Ok(PortMapping {
+            gateway_name: gateway.name,
+            external_port: self.external_port,
+            internal_port: self.internal_port,
+            local_addr: self.local_addr.clone(),
+        })
+    }
+}
+
+struct PortMapping {
+    gateway_name: String,
+    external_port: u16,
+    internal_port: u16,
+    local_addr: String,
+}
+
+struct Gateway {
+    name: String,
+    description_url: String,
+}
+
+struct WanService {
+    service_type: String,
+    control_url: String,
+}
+
+struct HttpUrl {
+    host: String,
+    port: u16,
+    path: String,
+}
+
+fn local_lan_addr() -> io::Result<String> {
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.connect("8.8.8.8:80")?;
+    Ok(socket.local_addr()?.ip().to_string())
+}
+
+fn discover_gateway() -> io::Result<Gateway> {
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_read_timeout(Some(Duration::from_secs(3)))?;
+
+    for search_target in [
+        "urn:schemas-upnp-org:device:InternetGatewayDevice:1",
+        "urn:schemas-upnp-org:service:WANIPConnection:1",
+        "urn:schemas-upnp-org:service:WANPPPConnection:1",
+    ] {
+        let message = format!(
+            "M-SEARCH * HTTP/1.1\r\n\
+             HOST: 239.255.255.250:1900\r\n\
+             MAN: \"ssdp:discover\"\r\n\
+             MX: 2\r\n\
+             ST: {search_target}\r\n\r\n"
+        );
+        socket.send_to(message.as_bytes(), "239.255.255.250:1900")?;
+    }
+
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match socket.recv_from(&mut buffer) {
+            Ok((len, source)) => {
+                let response = String::from_utf8_lossy(&buffer[..len]);
+                if let Some(location) = header_value(&response, "LOCATION") {
+                    return Ok(Gateway {
+                        name: source.to_string(),
+                        description_url: location,
+                    });
+                }
+            }
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::TimedOut =>
+            {
+                return Err(io::Error::other("no UPnP gateway responded"));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn find_wan_service(description: &str, description_url: &str) -> io::Result<WanService> {
+    for service in service_blocks(description) {
+        let Some(service_type) = tag_value(service, "serviceType") else {
+            continue;
+        };
+        if !service_type.contains("WANIPConnection") && !service_type.contains("WANPPPConnection") {
+            continue;
+        }
+
+        let Some(control_url) = tag_value(service, "controlURL") else {
+            continue;
+        };
+
+        return Ok(WanService {
+            service_type,
+            control_url: absolutize_url(description_url, &control_url)?,
+        });
+    }
+
+    Err(io::Error::other(
+        "gateway description did not include a WAN connection service",
+    ))
+}
+
+fn service_blocks(description: &str) -> Vec<&str> {
+    let mut blocks = Vec::new();
+    let mut rest = description;
+
+    while let Some(start) = rest.find("<service>") {
+        rest = &rest[start + "<service>".len()..];
+        let Some(end) = rest.find("</service>") else {
+            break;
+        };
+        blocks.push(&rest[..end]);
+        rest = &rest[end + "</service>".len()..];
+    }
+
+    blocks
+}
+
+fn tag_value(input: &str, tag: &str) -> Option<String> {
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let start = input.find(&start_tag)? + start_tag.len();
+    let end = input[start..].find(&end_tag)? + start;
+    Some(input[start..end].trim().to_string())
+}
+
+fn header_value(input: &str, name: &str) -> Option<String> {
+    input.lines().find_map(|line| {
+        let (header_name, value) = line.split_once(':')?;
+        if header_name.eq_ignore_ascii_case(name) {
+            Some(value.trim().to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn http_get(url: &str) -> io::Result<String> {
+    let url = parse_http_url(url)?;
+    let mut stream = TcpStream::connect((&*url.host, url.port))?;
+    write!(
+        stream,
+        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+        url.path, url.host
+    )?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    Ok(response)
+}
+
+fn http_post(url: &str, soap_action: &str, body: &str) -> io::Result<String> {
+    let url = parse_http_url(url)?;
+    let mut stream = TcpStream::connect((&*url.host, url.port))?;
+    write!(
+        stream,
+        "POST {} HTTP/1.1\r\n\
+         Host: {}\r\n\
+         Content-Type: text/xml; charset=\"utf-8\"\r\n\
+         SOAPAction: \"{}\"\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n{}",
+        url.path,
+        url.host,
+        soap_action,
+        body.len(),
+        body
+    )?;
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    Ok(response)
+}
+
+fn parse_http_url(url: &str) -> io::Result<HttpUrl> {
+    let Some(rest) = url.strip_prefix("http://") else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "only http:// UPnP URLs are supported",
+        ));
+    };
+
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host.to_string(), port.parse().unwrap_or(80)),
+        None => (authority.to_string(), 80),
+    };
+
+    Ok(HttpUrl {
+        host,
+        port,
+        path: format!("/{path}"),
+    })
+}
+
+fn absolutize_url(base: &str, value: &str) -> io::Result<String> {
+    if value.starts_with("http://") {
+        return Ok(value.to_string());
+    }
+
+    let base = parse_http_url(base)?;
+    let path = if value.starts_with('/') {
+        value.to_string()
+    } else {
+        let parent = base.path.rsplit_once('/').map_or("/", |(parent, _)| parent);
+        format!("{parent}/{value}")
+    };
+
+    Ok(format!("http://{}:{}{}", base.host, base.port, path))
+}
+
+fn handle_connection(mut stream: TcpStream, config: &Config) -> io::Result<()> {
+    let peer = stream
+        .peer_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
     let request = match read_request(&mut stream)? {
         Some(request) => request,
         None => return Ok(()),
     };
 
     if request.method != "GET" && request.method != "HEAD" {
+        log_request(&peer, &request, "405");
         return write_text_response(
             &mut stream,
             "405 Method Not Allowed",
@@ -74,9 +1452,21 @@ fn handle_connection(mut stream: TcpStream, root: &Path) -> io::Result<()> {
         );
     }
 
-    let path = match path_for_request(root, &request.target) {
+    if !is_authorized(&request, config.auth.as_ref()) {
+        log_request(&peer, &request, "401");
+        return write_text_response(
+            &mut stream,
+            "401 Unauthorized",
+            "Authentication required\n",
+            &[("WWW-Authenticate", "Basic realm=\"Splinterparty\"")],
+            request.method == "HEAD",
+        );
+    }
+
+    let requested_path = match path_for_request(&config.root, &request.target) {
         Some(path) => path,
         None => {
+            log_request(&peer, &request, "400");
             return write_text_response(
                 &mut stream,
                 "400 Bad Request",
@@ -87,9 +1477,35 @@ fn handle_connection(mut stream: TcpStream, root: &Path) -> io::Result<()> {
         }
     };
 
+    let path = match contained_path(&config.root, &requested_path) {
+        Ok(path) => path,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            log_request(&peer, &request, "404");
+            return write_text_response(
+                &mut stream,
+                "404 Not Found",
+                "Not found\n",
+                &[],
+                request.method == "HEAD",
+            );
+        }
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            log_request(&peer, &request, "403");
+            return write_text_response(
+                &mut stream,
+                "403 Forbidden",
+                "Path escapes served directory\n",
+                &[],
+                request.method == "HEAD",
+            );
+        }
+        Err(error) => return Err(error),
+    };
+
     let metadata = match fs::metadata(&path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            log_request(&peer, &request, "404");
             return write_text_response(
                 &mut stream,
                 "404 Not Found",
@@ -102,13 +1518,23 @@ fn handle_connection(mut stream: TcpStream, root: &Path) -> io::Result<()> {
     };
 
     if metadata.is_dir() {
-        return serve_directory(&mut stream, root, &path, request.method == "HEAD");
+        log_request(&peer, &request, "200");
+        return serve_directory(&mut stream, &config.root, &path, request.method == "HEAD");
     }
 
     if metadata.is_file() {
-        return serve_file(&mut stream, &path, metadata.len(), request.method == "HEAD");
+        return serve_file(
+            &mut stream,
+            &peer,
+            &request,
+            &path,
+            &metadata,
+            metadata.len(),
+            request.method == "HEAD",
+        );
     }
 
+    log_request(&peer, &request, "403");
     write_text_response(
         &mut stream,
         "403 Forbidden",
@@ -118,9 +1544,82 @@ fn handle_connection(mut stream: TcpStream, root: &Path) -> io::Result<()> {
     )
 }
 
+fn log_request(peer: &str, request: &Request, status: &str) {
+    println!(
+        "{} {} -> {} ({peer})",
+        request.method, request.target, status
+    );
+}
+
 struct Request {
     method: String,
     target: String,
+    headers: Vec<(String, String)>,
+}
+
+impl Request {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ByteRange {
+    start: u64,
+    end: u64,
+}
+
+fn parse_range_header(value: &str, len: u64) -> Option<ByteRange> {
+    if len == 0 {
+        return None;
+    }
+
+    let range = value.trim().strip_prefix("bytes=")?;
+    if range.contains(',') {
+        return None;
+    }
+
+    let (start, end) = range.split_once('-')?;
+    match (start.trim(), end.trim()) {
+        ("", "") => None,
+        ("", suffix_len) => {
+            let suffix_len = suffix_len.parse::<u64>().ok()?;
+            if suffix_len == 0 {
+                return None;
+            }
+
+            let start = len.saturating_sub(suffix_len);
+            Some(ByteRange {
+                start,
+                end: len - 1,
+            })
+        }
+        (start, "") => {
+            let start = start.parse::<u64>().ok()?;
+            if start >= len {
+                return None;
+            }
+            Some(ByteRange {
+                start,
+                end: len - 1,
+            })
+        }
+        (start, end) => {
+            let start = start.parse::<u64>().ok()?;
+            let end = end.parse::<u64>().ok()?;
+            if start > end || start >= len {
+                return None;
+            }
+
+            Some(ByteRange {
+                start,
+                end: end.min(len - 1),
+            })
+        }
+    }
 }
 
 fn read_request(stream: &mut TcpStream) -> io::Result<Option<Request>> {
@@ -141,7 +1640,52 @@ fn read_request(stream: &mut TcpStream) -> io::Result<Option<Request>> {
         None => return Ok(None),
     };
 
-    Ok(Some(Request { method, target }))
+    let mut headers = Vec::new();
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.push((name.trim().to_string(), value.trim().to_string()));
+        }
+    }
+
+    Ok(Some(Request {
+        method,
+        target,
+        headers,
+    }))
+}
+
+fn is_authorized(request: &Request, auth: Option<&AuthConfig>) -> bool {
+    let Some(auth) = auth else {
+        return true;
+    };
+
+    let Some(header) = request
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("Authorization"))
+        .map(|(_, value)| value)
+    else {
+        return false;
+    };
+
+    let Some(encoded) = header.strip_prefix("Basic ") else {
+        return false;
+    };
+
+    let Some(decoded) = base64_decode(encoded).and_then(|bytes| String::from_utf8(bytes).ok())
+    else {
+        return false;
+    };
+
+    decoded == format!("{}:{}", auth.username, auth.password)
 }
 
 fn path_for_request(root: &Path, target: &str) -> Option<PathBuf> {
@@ -159,6 +1703,18 @@ fn path_for_request(root: &Path, target: &str) -> Option<PathBuf> {
     }
 
     Some(path)
+}
+
+fn contained_path(root: &Path, requested_path: &Path) -> io::Result<PathBuf> {
+    let canonical = fs::canonicalize(requested_path)?;
+    if canonical.starts_with(root) {
+        Ok(canonical)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "resolved path escapes served directory",
+        ))
+    }
 }
 
 fn percent_decode(value: &str) -> Option<String> {
@@ -201,7 +1757,12 @@ fn serve_directory(
     skip_body: bool,
 ) -> io::Result<()> {
     let mut entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
+    entries.sort_by_key(|entry| {
+        (
+            entry.file_type().map(|kind| !kind.is_dir()).unwrap_or(true),
+            entry.file_name(),
+        )
+    });
 
     let relative = path.strip_prefix(root).unwrap_or(path);
     let title = if relative.as_os_str().is_empty() {
@@ -209,34 +1770,87 @@ fn serve_directory(
     } else {
         format!("/{}", relative.display())
     };
+    let entry_count = entries.len();
 
     let mut body = String::new();
-    body.push_str("<!doctype html><html><head><meta charset=\"utf-8\">");
-    body.push_str("<title>");
+    body.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
+    body.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
+    body.push_str("<title>Splinterparty ");
     body.push_str(&escape_html(&title));
-    body.push_str("</title></head><body><h1>");
+    body.push_str("</title><style>");
+    body.push_str(DIRECTORY_CSS);
+    body.push_str(
+        "</style></head><body><main><header><div><p class=\"eyebrow\">Splinterparty</p><h1>",
+    );
     body.push_str(&escape_html(&title));
-    body.push_str("</h1><ul>");
+    body.push_str("</h1></div><div class=\"summary\"><span>");
+    body.push_str(&entry_count.to_string());
+    body.push_str("</span><small>items</small></div></header>");
 
     if !relative.as_os_str().is_empty() {
-        body.push_str("<li><a href=\"../\">../</a></li>");
+        body.push_str("<nav><a class=\"up\" href=\"../\">Up one directory</a></nav>");
     }
+
+    body.push_str("<section class=\"browser\"><div class=\"row head\"><span>Name</span><span>Type</span><span>Size</span><span>Modified</span><span></span></div>");
 
     for entry in entries {
         let name = entry.file_name();
         let display_name = name.to_string_lossy();
-        let suffix = if entry.file_type()?.is_dir() { "/" } else { "" };
+        let metadata = entry.metadata()?;
+        let is_dir = metadata.is_dir();
+        let suffix = if is_dir { "/" } else { "" };
+        let type_label = if is_dir {
+            "Folder"
+        } else if metadata.len() > LARGE_FILE_PART_SIZE {
+            "Large file"
+        } else {
+            "File"
+        };
+        let size_label = if is_dir {
+            "-".to_string()
+        } else {
+            human_bytes(metadata.len())
+        };
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(system_time_label)
+            .unwrap_or_else(|| "-".to_string());
+        let href = format!("{}{}", url_encode_path_segment(&name), suffix);
 
-        body.push_str("<li><a href=\"");
-        body.push_str(&url_encode_path_segment(&name));
-        body.push_str(suffix);
-        body.push_str("\">");
+        body.push_str("<div class=\"row\"><a class=\"name\" href=\"");
+        body.push_str(&href);
+        body.push_str("\"><span class=\"icon\">");
+        body.push_str(if is_dir { "DIR" } else { "FILE" });
+        body.push_str("</span><span>");
         body.push_str(&escape_html(&display_name));
         body.push_str(suffix);
-        body.push_str("</a></li>");
+        body.push_str("</span></a><span class=\"type ");
+        body.push_str(if metadata.len() > LARGE_FILE_PART_SIZE && !is_dir {
+            "large"
+        } else {
+            ""
+        });
+        body.push_str("\">");
+        body.push_str(type_label);
+        body.push_str("</span><span>");
+        body.push_str(&size_label);
+        body.push_str("</span><span>");
+        body.push_str(&modified);
+        body.push_str("</span><span class=\"actions\">");
+        if !is_dir {
+            body.push_str("<a href=\"");
+            body.push_str(&href);
+            body.push_str("\" download>Download</a>");
+        }
+        body.push_str("</span></div>");
     }
 
-    body.push_str("</ul></body></html>\n");
+    if entry_count == 0 {
+        body.push_str("<div class=\"empty\">This directory is empty.</div>");
+    }
+
+    body.push_str("</section></main></body></html>\n");
 
     write_text_response(
         stream,
@@ -247,25 +1861,81 @@ fn serve_directory(
     )
 }
 
-fn serve_file(stream: &mut TcpStream, path: &Path, len: u64, skip_body: bool) -> io::Result<()> {
+fn serve_file(
+    stream: &mut TcpStream,
+    peer: &str,
+    request: &Request,
+    path: &Path,
+    metadata: &fs::Metadata,
+    len: u64,
+    skip_body: bool,
+) -> io::Result<()> {
+    let etag = file_etag(metadata);
+    if request
+        .header("If-None-Match")
+        .is_some_and(|value| etag_matches(value, &etag))
+    {
+        log_request(peer, request, "304");
+        write!(
+            stream,
+            "HTTP/1.1 304 Not Modified\r\nETag: {etag}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+        )?;
+        return Ok(());
+    }
+
+    let range = request
+        .header("Range")
+        .and_then(|value| parse_range_header(value, len));
+
+    if request.header("Range").is_some() && range.is_none() {
+        log_request(peer, request, "416");
+        write!(
+            stream,
+            "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: 0\r\nContent-Range: bytes */{len}\r\nConnection: close\r\n\r\n"
+        )?;
+        return Ok(());
+    }
+
+    let (status, start, end) = match range {
+        Some(range) => ("206 Partial Content", range.start, range.end),
+        None => ("200 OK", 0, len.saturating_sub(1)),
+    };
+    log_request(peer, request, if range.is_some() { "206" } else { "200" });
+    let content_len = if len == 0 { 0 } else { end - start + 1 };
+
     write!(
         stream,
-        "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nContent-Type: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Length: {content_len}\r\nContent-Type: {}\r\nETag: {etag}\r\nAccept-Ranges: bytes\r\n",
         content_type(path)
     )?;
+    if range.is_some() {
+        write!(stream, "Content-Range: bytes {start}-{end}/{len}\r\n")?;
+    }
+    write!(stream, "Connection: close\r\n\r\n")?;
 
     if skip_body {
         return Ok(());
     }
 
     let mut file = File::open(path)?;
+    if start > 0 {
+        file.seek(SeekFrom::Start(start))?;
+    }
+
     let mut buffer = [0_u8; READ_BUF_SIZE];
+    let mut remaining = content_len;
     loop {
-        let bytes_read = file.read(&mut buffer)?;
+        if remaining == 0 {
+            break;
+        }
+
+        let read_len = buffer.len().min(remaining as usize);
+        let bytes_read = file.read(&mut buffer[..read_len])?;
         if bytes_read == 0 {
             break;
         }
         stream.write_all(&buffer[..bytes_read])?;
+        remaining -= bytes_read as u64;
     }
 
     Ok(())
@@ -314,6 +1984,28 @@ fn content_type(path: &Path) -> &'static str {
     }
 }
 
+fn file_etag(metadata: &fs::Metadata) -> String {
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+
+    weak_etag(metadata.len(), modified)
+}
+
+fn weak_etag(len: u64, modified_unix_seconds: u64) -> String {
+    format!("W/\"{len:x}-{modified_unix_seconds:x}\"")
+}
+
+fn etag_matches(header: &str, etag: &str) -> bool {
+    header
+        .split(',')
+        .map(str::trim)
+        .any(|value| value == "*" || value == etag)
+}
+
 fn escape_html(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -333,4 +2025,267 @@ fn url_encode_path_segment(value: &OsStr) -> String {
             byte => format!("%{byte:02X}").chars().collect(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_path_rejects_parent_components_after_decoding() {
+        let root = Path::new("/srv/files");
+
+        assert!(path_for_request(root, "/%2e%2e/secrets.txt").is_none());
+        assert!(path_for_request(root, "/nested/../secrets.txt").is_none());
+    }
+
+    #[test]
+    fn request_path_accepts_normal_relative_paths() {
+        let root = Path::new("/srv/files");
+
+        assert_eq!(
+            path_for_request(root, "/photos/image%201.jpg?download=1"),
+            Some(PathBuf::from("/srv/files/photos/image 1.jpg"))
+        );
+    }
+
+    #[test]
+    fn percent_decode_rejects_invalid_input() {
+        assert_eq!(
+            percent_decode("/file%20name"),
+            Some("/file name".to_string())
+        );
+        assert_eq!(percent_decode("/bad%2"), None);
+        assert_eq!(percent_decode("/bad%xx"), None);
+    }
+
+    #[test]
+    fn bool_parser_accepts_setup_config_values() {
+        assert!(parse_bool("true"));
+        assert!(parse_bool("YES"));
+        assert!(parse_bool("1"));
+        assert!(!parse_bool("false"));
+    }
+
+    #[test]
+    fn mount_paths_decode_proc_mount_escapes() {
+        assert_eq!(
+            decode_mount_path("/media/My\\040Drive/backup\\134set"),
+            "/media/My Drive/backup\\set"
+        );
+    }
+
+    #[test]
+    fn mount_filter_keeps_user_storage_locations() {
+        assert!(should_show_mount("/", "ext4"));
+        assert!(should_show_mount("/mnt/archive", "ext4"));
+        assert!(should_show_mount("/media/usb", "vfat"));
+        assert!(!should_show_mount("/proc", "proc"));
+        assert!(!should_show_mount("/run", "tmpfs"));
+    }
+
+    #[test]
+    fn base64_decoder_handles_basic_auth_payloads() {
+        assert_eq!(
+            base64_decode("c3BsaW50ZXI6c2VjcmV0"),
+            Some(b"splinter:secret".to_vec())
+        );
+        assert_eq!(base64_decode("not valid!"), None);
+    }
+
+    #[test]
+    fn authorization_accepts_matching_basic_credentials() {
+        let request = Request {
+            method: "GET".to_string(),
+            target: "/".to_string(),
+            headers: vec![(
+                "Authorization".to_string(),
+                "Basic c3BsaW50ZXI6c2VjcmV0".to_string(),
+            )],
+        };
+        let auth = AuthConfig {
+            username: "splinter".to_string(),
+            password: "secret".to_string(),
+        };
+
+        assert!(is_authorized(&request, Some(&auth)));
+    }
+
+    #[test]
+    fn authorization_rejects_missing_or_wrong_credentials() {
+        let auth = AuthConfig {
+            username: "splinter".to_string(),
+            password: "secret".to_string(),
+        };
+        let missing = Request {
+            method: "GET".to_string(),
+            target: "/".to_string(),
+            headers: Vec::new(),
+        };
+        let wrong = Request {
+            method: "GET".to_string(),
+            target: "/".to_string(),
+            headers: vec![(
+                "Authorization".to_string(),
+                "Basic c3BsaW50ZXI6d3Jvbmc=".to_string(),
+            )],
+        };
+
+        assert!(!is_authorized(&missing, Some(&auth)));
+        assert!(!is_authorized(&wrong, Some(&auth)));
+        assert!(is_authorized(&missing, None));
+    }
+
+    #[test]
+    fn auth_config_requires_both_username_and_password() {
+        assert!(
+            AuthConfig::from_parts(Some("admin".to_string()), Some("admin".to_string())).is_some()
+        );
+        assert!(AuthConfig::from_parts(Some("admin".to_string()), None).is_none());
+        assert!(AuthConfig::from_parts(None, Some("admin".to_string())).is_none());
+        assert!(AuthConfig::from_parts(Some(String::new()), Some("admin".to_string())).is_none());
+    }
+
+    #[test]
+    fn enabled_label_is_human_readable() {
+        assert_eq!(enabled_label(true), "enabled");
+        assert_eq!(enabled_label(false), "disabled");
+    }
+
+    #[test]
+    fn sha256_matches_known_vectors() {
+        let mut empty = Sha256::new();
+        empty.update(b"");
+        assert_eq!(
+            hex_bytes(&empty.finish()),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+
+        let mut abc = Sha256::new();
+        abc.update(b"abc");
+        assert_eq!(
+            hex_bytes(&abc.finish()),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn duplicate_scan_groups_files_by_size_and_hash() {
+        let root = env::temp_dir().join(format!("splinterparty-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("a.txt"), b"same").unwrap();
+        fs::write(root.join("nested").join("b.txt"), b"same").unwrap();
+        fs::write(root.join("c.txt"), b"diff").unwrap();
+
+        let report = find_duplicates(&root).unwrap();
+
+        assert_eq!(report.groups.len(), 1);
+        assert_eq!(report.groups[0].size, 4);
+        assert_eq!(report.groups[0].paths.len(), 2);
+        assert_eq!(report.duplicate_bytes, 4);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn contained_path_rejects_symlink_escape() {
+        let root = env::temp_dir().join(format!("splinterparty-contain-{}", std::process::id()));
+        let outside = env::temp_dir().join(format!("splinterparty-outside-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("secret.txt"), b"secret").unwrap();
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(outside.join("secret.txt"), root.join("link.txt")).unwrap();
+            assert!(contained_path(&root, &root.join("link.txt")).is_err());
+        }
+
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[test]
+    fn split_manifest_round_trips() {
+        let manifest = SplitManifest {
+            original_name: "video.mp4".to_string(),
+            original_size: LARGE_FILE_PART_SIZE + 7,
+            part_size: LARGE_FILE_PART_SIZE,
+            parts: vec![
+                SplitPart {
+                    index: 0,
+                    file_name: "00000000.part".to_string(),
+                    size: LARGE_FILE_PART_SIZE,
+                    sha256: "a".repeat(64),
+                },
+                SplitPart {
+                    index: 1,
+                    file_name: "00000001.part".to_string(),
+                    size: 7,
+                    sha256: "b".repeat(64),
+                },
+            ],
+        };
+
+        let parsed = SplitManifest::from_text(&manifest.to_text()).unwrap();
+
+        assert_eq!(parsed.original_name, "video.mp4");
+        assert_eq!(parsed.original_size, LARGE_FILE_PART_SIZE + 7);
+        assert_eq!(parsed.parts.len(), 2);
+        assert_eq!(parsed.parts[1].size, 7);
+    }
+
+    #[test]
+    fn unix_time_formatter_uses_utc_calendar_dates() {
+        assert_eq!(format_unix_seconds(0), "1970-01-01 00:00 UTC");
+        assert_eq!(format_unix_seconds(1_700_000_000), "2023-11-14 22:13 UTC");
+    }
+
+    #[test]
+    fn range_parser_accepts_standard_byte_ranges() {
+        assert_eq!(
+            parse_range_header("bytes=0-4", 10),
+            Some(ByteRange { start: 0, end: 4 })
+        );
+        assert_eq!(
+            parse_range_header("bytes=4-", 10),
+            Some(ByteRange { start: 4, end: 9 })
+        );
+        assert_eq!(
+            parse_range_header("bytes=-4", 10),
+            Some(ByteRange { start: 6, end: 9 })
+        );
+        assert_eq!(
+            parse_range_header("bytes=6-99", 10),
+            Some(ByteRange { start: 6, end: 9 })
+        );
+    }
+
+    #[test]
+    fn range_parser_rejects_invalid_ranges() {
+        assert_eq!(parse_range_header("items=0-4", 10), None);
+        assert_eq!(parse_range_header("bytes=8-4", 10), None);
+        assert_eq!(parse_range_header("bytes=10-", 10), None);
+        assert_eq!(parse_range_header("bytes=0-1,4-5", 10), None);
+        assert_eq!(parse_range_header("bytes=-0", 10), None);
+        assert_eq!(parse_range_header("bytes=0-0", 0), None);
+    }
+
+    #[test]
+    fn weak_etags_are_stable_and_quoted() {
+        assert_eq!(weak_etag(4096, 1_700_000_000), "W/\"1000-6553f100\"");
+    }
+
+    #[test]
+    fn etag_matching_handles_lists_and_wildcards() {
+        let etag = weak_etag(12, 34);
+
+        assert!(etag_matches(&etag, &etag));
+        assert!(etag_matches("W/\"bad\", W/\"c-22\"", &etag));
+        assert!(etag_matches("*", &etag));
+        assert!(!etag_matches("W/\"bad\"", &etag));
+    }
 }
