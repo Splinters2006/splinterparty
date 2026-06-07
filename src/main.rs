@@ -3540,23 +3540,21 @@ fn serve_directory(
             if let Ok(contents) = fs::read_to_string(entry.path()) {
                 if let Some(link) = RemoteLink::from_text(&contents) {
                     let href = link.href();
-                    body.push_str("<div class=\"row\"><a class=\"name\" href=\"");
+                    body.push_str(r#"<div class="row"><a class="name" href=""#);
                     body.push_str(&escape_html(&href));
-                    body.push_str("\"><span class=\"icon\">NET</span><span>");
+                    body.push_str(r#""><span class="icon">NET</span><span>"#);
                     body.push_str(&escape_html(&link.name));
-                    body.push_str(" ↗</span></a><span class=\"type\">Remote link</span><span>-</span><span>-</span><span class=\"actions\"><a href=\"");
+                    body.push_str(r#" ↗</span></a><span class="type">Remote link</span><span>-</span><span>-</span><span class="actions"><a href=""#);
                     body.push_str(&escape_html(&href));
-                    body.push_str("\">Open</a> ");
-
+                    body.push_str(r#"">Open</a> "#);
                     let delete_path = format!(
                         "{}/{}",
                         url_path_for(root, path).trim_end_matches('/'),
                         url_encode_path_segment(&name)
                     );
-
-                    body.push_str("<a href=\"/__delete?path=");
+                    body.push_str(r#"<a href="/__delete?path="#);
                     body.push_str(&url_encode_query_value(&delete_path));
-                    body.push_str("\">Delete</a></span></div>");
+                    body.push_str(r#"">Delete</a></span></div>"#);
                     continue;
                 }
             }
