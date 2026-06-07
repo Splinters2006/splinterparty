@@ -4624,13 +4624,18 @@ fn serve_directory(
             .ok()
             .and_then(system_time_label)
             .unwrap_or_else(|| "-".to_string());
-        let href = format!("{}{}", url_encode_path_segment(&name), suffix);
-
         let item_url_path = format!(
             "{}/{}",
             url_path_for(root, path).trim_end_matches('/'),
             url_encode_path_segment(&name)
         );
+
+        let href = if is_dir {
+            format!("{}/", item_url_path)
+        } else {
+            item_url_path.clone()
+        };
+
         body.push_str("<div class=\"row item\" data-name=\"");
         body.push_str(&escape_html(&display_name));
         body.push_str("\" data-path=\"");
