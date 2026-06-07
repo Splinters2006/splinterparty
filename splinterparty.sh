@@ -120,9 +120,24 @@ cmd_install() {
 
     cargo build --release
 
+    SERVICE_WAS_RUNNING=0
+
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl --user is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+            echo "Running service detected. Stopping Splinterparty before replacing binary..."
+            systemctl --user stop "$SERVICE_NAME"
+            SERVICE_WAS_RUNNING=1
+        fi
+    fi
+
     mkdir -p "$INSTALL_DIR"
-    cp "target/release/$SERVICE_NAME" "$BINARY"
-    chmod +x "$BINARY"
+
+    install -m 755 "target/release/$SERVICE_NAME" "$BINARY"
+
+    if [ "$SERVICE_WAS_RUNNING" -eq 1 ]; then
+        echo "Restarting Splinterparty service..."
+        systemctl --user start "$SERVICE_NAME"
+    fi
 
     echo
     if ! printf '%s' ":$PATH:" | grep -q ":$INSTALL_DIR:"; then
@@ -132,9 +147,6 @@ cmd_install() {
     fi
 
     echo "Splinterparty installed to $BINARY."
-    echo "Next run:"
-    echo "  ./splinterparty.sh setup"
-    echo "  ./splinterparty.sh service-install"
 }
 
 cmd_setup() {
@@ -237,6 +249,16 @@ cmd_all() {
     cmd_service_install
 }
 
+cmd_update() {
+    fail_if_root update
+
+    if command -v git >/dev/null 2>&1 && [ -d .git ]; then
+        git pull
+    fi
+
+    cmd_install
+}
+
 case "${1:-}" in
     install)         cmd_install ;;
     setup)           cmd_setup ;;
@@ -248,8 +270,9 @@ case "${1:-}" in
     status)          cmd_status ;;
     logs)            cmd_logs ;;
     all)             cmd_all ;;
+    update)          cmd_update ;;
     *)
-        echo "Usage: $0 {install|setup|service-install|remove|start|stop|restart|status|logs|all}"
+        echo "Usage: $0 {install|setup|service-install|remove|start|stop|restart|status|logs|all|update}"
         exit 1
         ;;
 esac
