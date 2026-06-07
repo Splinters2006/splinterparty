@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+cause std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsStr;
 use std::fmt::Write as _;
@@ -42,6 +42,13 @@ a:hover { text-decoration: underline; }
 .actions { text-align: right; }
 .actions a { font-weight: 650; }
 .empty { padding: 28px 16px; color: #657386; }
+.upload-panel { margin-top: 18px; border: 1px solid #d9dee7; border-radius: 8px; background: #ffffff; padding: 16px; }
+.upload-panel h2 { margin: 0 0 12px; font-size: 18px; }
+.upload-panel form { display: grid; grid-template-columns: minmax(180px, 240px) 1fr minmax(150px, 220px) auto; gap: 14px; align-items: end; }
+.upload-panel label { display: grid; gap: 6px; color: #1f2937; font-weight: 700; }
+.upload-panel input, textarea { width: 100%; min-height: 40px; border: 1px solid #cbd5e1; border-radius: 8px; padding: 8px 10px; font: inherit; }
+.upload-panel button { min-height: 42px; border: 0; border-radius: 8px; background: #155eef; color: #ffffff; font: inherit; font-weight: 750; cursor: pointer; }
+textarea { min-height: 120px; resize: vertical; }
 @media (max-width: 760px) {
   main { width: min(100vw - 20px, 1120px); padding: 18px 0; }
   header { align-items: stretch; flex-direction: column; }
@@ -49,6 +56,7 @@ a:hover { text-decoration: underline; }
   .row { grid-template-columns: 1fr; gap: 4px; align-items: start; padding: 12px; }
   .row.head { display: none; }
   .actions { text-align: left; }
+  .upload-panel form { grid-template-columns: 1fr; }
 }
 "#;
 const FORM_CSS: &str = r#"
@@ -95,6 +103,11 @@ fn main() -> io::Result<()> {
         config.root.display(),
         config.bind_addr
     );
+    if !directory_writable(&config.root) {
+        eprintln!(
+            "warning: served directory is not writable; uploads and folder creation will fail until OS permissions are fixed"
+        );
+    }
 
     let config = Arc::new(config);
     for stream in listener.incoming() {
@@ -1001,31 +1014,8 @@ fn prompt_auth_config() -> io::Result<Option<AuthConfig>> {
 
 fn prompt_served_root() -> io::Result<PathBuf> {
     let default_root = env::current_dir()?;
-    let mounts = mount_points();
-
-    if !mounts.is_empty() {
-        println!("Detected mount points:");
-        for (index, mount) in mounts.iter().enumerate() {
-            println!("  {}. {}", index + 1, mount.display());
-        }
-    }
-
-    loop {
-        let value = prompt_string(
-            "Directory, mount point number, or mounted partition to serve",
-            &default_root.display().to_string(),
-        )?;
-
-        if let Ok(index) = value.parse::<usize>() {
-            if let Some(mount) = mounts.get(index.saturating_sub(1)) {
-                return Ok(mount.clone());
-            }
-            println!("please choose one of the listed mount point numbers");
-            continue;
-        }
-
-        return Ok(PathBuf::from(value));
-    }
+    let value = prompt_string("Directory to serve", &default_root.display().to_string())?;
+    Ok(PathBuf::from(value))
 }
 
 fn prompt_string(label: &str, default: &str) -> io::Result<String> {
@@ -1113,70 +1103,6 @@ fn base64_decode(value: &str) -> Option<Vec<u8>> {
     }
 
     if chunk_len == 0 { Some(output) } else { None }
-}
-
-fn mount_points() -> Vec<PathBuf> {
-    let Ok(contents) = fs::read_to_string("/proc/mounts") else {
-        return Vec::new();
-    };
-
-    let mut mounts = contents
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            let _device = parts.next()?;
-            let mount = decode_mount_path(parts.next()?);
-            let fs_type = parts.next()?;
-
-            if should_show_mount(&mount, fs_type) {
-                Some(PathBuf::from(mount))
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-
-    mounts.sort();
-    mounts.dedup();
-    mounts
-}
-
-fn should_show_mount(mount: &str, fs_type: &str) -> bool {
-    if matches!(
-        fs_type,
-        "autofs"
-            | "binfmt_misc"
-            | "cgroup"
-            | "cgroup2"
-            | "configfs"
-            | "debugfs"
-            | "devpts"
-            | "devtmpfs"
-            | "fusectl"
-            | "hugetlbfs"
-            | "mqueue"
-            | "proc"
-            | "pstore"
-            | "securityfs"
-            | "sysfs"
-            | "tmpfs"
-            | "tracefs"
-    ) {
-        return false;
-    }
-
-    mount == "/"
-        || mount.starts_with("/home")
-        || mount.starts_with("/media")
-        || mount.starts_with("/mnt")
-}
-
-fn decode_mount_path(value: &str) -> String {
-    value
-        .replace("\\040", " ")
-        .replace("\\011", "\t")
-        .replace("\\012", "\n")
-        .replace("\\134", "\\")
 }
 
 struct PortForwarder {
@@ -1931,7 +1857,18 @@ fn handle_share_route(
         let path = request
             .query_value("path")
             .unwrap_or_else(|| "/".to_string());
-        let folder = folder_from_url_path(&config.root, &path)?;
+        let folder = match folder_from_url_path(&config.root, &path) {
+            Ok(folder) => folder,
+            Err(_) => {
+                return write_html_response(
+                    stream,
+                    "400 Bad Request",
+                    &folder_only_html(&path),
+                    &[],
+                    false,
+                );
+            }
+        };
         let exists = folder.join(SHARE_FILE).exists();
         return write_html_response(
             stream,
@@ -1957,7 +1894,18 @@ fn handle_share_route(
     let recovery = form_value(&form, "recovery").unwrap_or_default();
     let read_pin = form_value(&form, "read_pin").unwrap_or_default();
     let write_pin = form_value(&form, "write_pin").unwrap_or_default();
-    let folder = folder_from_url_path(&config.root, &path)?;
+    let folder = match folder_from_url_path(&config.root, &path) {
+        Ok(folder) => folder,
+        Err(_) => {
+            return write_html_response(
+                stream,
+                "400 Bad Request",
+                &folder_only_html(&path),
+                &[],
+                false,
+            );
+        }
+    };
     let share_path = folder.join(SHARE_FILE);
 
     if recovery.is_empty() || write_pin.is_empty() {
@@ -1996,7 +1944,21 @@ fn handle_share_route(
         },
         &write_pin,
     );
-    fs::write(&share_path, share.to_text())?;
+    if let Err(error) = fs::write(&share_path, share.to_text()) {
+        return write_html_response(
+            stream,
+            "500 Internal Server Error",
+            &folder_operation_error_html(
+                &path,
+                &format!(
+                    "Could not save folder PINs. {}",
+                    write_permission_message(&path, &error)
+                ),
+            ),
+            &[],
+            false,
+        );
+    }
     write_redirect_with_cookie(stream, &path, PIN_COOKIE, &write_pin)
 }
 
@@ -2058,11 +2020,52 @@ fn handle_folder_route(
         );
     }
 
-    let parent = folder_from_url_path(&config.root, &parent_path)?;
-    let parent_metadata = fs::metadata(&parent)?;
-    if let Some((_share_dir, share)) =
-        find_applicable_share(&config.root, &parent, &parent_metadata)?
-    {
+    let parent = match folder_from_url_path(&config.root, &parent_path) {
+        Ok(parent) => parent,
+        Err(error) => {
+            return write_html_response(
+                stream,
+                "400 Bad Request",
+                &folder_operation_error_html(
+                    &parent_path,
+                    &format!("Could not open parent folder: {error}."),
+                ),
+                &[],
+                false,
+            );
+        }
+    };
+    let parent_metadata = match fs::metadata(&parent) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return write_html_response(
+                stream,
+                "500 Internal Server Error",
+                &folder_operation_error_html(
+                    &parent_path,
+                    &format!("Could not inspect parent folder: {error}."),
+                ),
+                &[],
+                false,
+            );
+        }
+    };
+    let applicable_share = match find_applicable_share(&config.root, &parent, &parent_metadata) {
+        Ok(share) => share,
+        Err(error) => {
+            return write_html_response(
+                stream,
+                "500 Internal Server Error",
+                &folder_operation_error_html(
+                    &parent_path,
+                    &format!("Could not read folder sharing settings: {error}."),
+                ),
+                &[],
+                false,
+            );
+        }
+    };
+    if let Some((_share_dir, share)) = applicable_share {
         if !share.allows_write(parent_pin.as_deref()) {
             return write_html_response(
                 stream,
@@ -2078,7 +2081,21 @@ fn handle_folder_route(
     }
 
     let new_folder = parent.join(&folder_name);
-    fs::create_dir(&new_folder)?;
+    if let Err(error) = fs::create_dir(&new_folder) {
+        return write_html_response(
+            stream,
+            "500 Internal Server Error",
+            &folder_form_html(
+                &parent_path,
+                Some(&format!(
+                    "Could not create folder. {}",
+                    write_permission_message(&parent_path, &error)
+                )),
+            ),
+            &[],
+            false,
+        );
+    }
     let share = ShareConfig::new(
         &recovery,
         if read_pin.is_empty() {
@@ -2088,7 +2105,22 @@ fn handle_folder_route(
         },
         &write_pin,
     );
-    fs::write(new_folder.join(SHARE_FILE), share.to_text())?;
+    if let Err(error) = fs::write(new_folder.join(SHARE_FILE), share.to_text()) {
+        let _ = fs::remove_dir(&new_folder);
+        return write_html_response(
+            stream,
+            "500 Internal Server Error",
+            &folder_form_html(
+                &parent_path,
+                Some(&format!(
+                    "Could not save folder PINs. {}",
+                    write_permission_message(&parent_path, &error)
+                )),
+            ),
+            &[],
+            false,
+        );
+    }
 
     let new_path = format!(
         "{}/{}",
@@ -2113,32 +2145,47 @@ fn handle_upload_route(
         );
     }
 
-    let form = String::from_utf8_lossy(&request.body);
-    let path = form_value(&form, "path").unwrap_or_else(|| "/".to_string());
-    let filename = form_value(&form, "filename").unwrap_or_default();
-    let contents = form_value(&form, "contents").unwrap_or_default();
-    let pin = form_value(&form, "write_pin")
-        .filter(|pin| !pin.is_empty())
-        .or_else(|| request_pin(request));
+    let upload = parse_upload_request(request)?;
+    let path = upload.path;
+    let filename = upload.filename;
+    let contents = upload.contents;
+    let pin = request_pin(request);
 
     if !is_safe_folder_name(&filename) {
         return write_html_response(
             stream,
             "400 Bad Request",
-            &upload_error_html(&path, "Filename cannot be empty or contain path separators."),
+            &upload_error_html(
+                &path,
+                "Filename cannot be empty or contain path separators.",
+            ),
             &[],
             false,
         );
     }
 
-    let folder = folder_from_url_path(&config.root, &path)?;
+    let folder = match folder_from_url_path(&config.root, &path) {
+        Ok(folder) => folder,
+        Err(_) => {
+            return write_html_response(
+                stream,
+                "400 Bad Request",
+                &folder_only_html(&path),
+                &[],
+                false,
+            );
+        }
+    };
     let metadata = fs::metadata(&folder)?;
     if let Some((_share_dir, share)) = find_applicable_share(&config.root, &folder, &metadata)? {
         if !share.allows_write(pin.as_deref()) {
             return write_html_response(
                 stream,
                 "403 Forbidden",
-                &upload_error_html(&path, "This folder requires its read+write PIN to upload."),
+                &upload_error_html(
+                    &path,
+                    "Unlock this directory with its read+write PIN before uploading.",
+                ),
                 &[],
                 false,
             );
@@ -2156,8 +2203,134 @@ fn handle_upload_route(
         );
     }
 
-    fs::write(&target, contents.as_bytes())?;
+    if let Err(error) = fs::write(&target, &contents) {
+        return write_html_response(
+            stream,
+            "500 Internal Server Error",
+            &upload_error_html(
+                &path,
+                &format!(
+                    "Could not save upload. {}",
+                    write_permission_message(&path, &error)
+                ),
+            ),
+            &[],
+            false,
+        );
+    }
     write_redirect_with_cookie(stream, &path, PIN_COOKIE, pin.as_deref().unwrap_or(""))
+}
+
+struct UploadRequest {
+    path: String,
+    filename: String,
+    contents: Vec<u8>,
+}
+
+fn parse_upload_request(request: &Request) -> io::Result<UploadRequest> {
+    let content_type = request.header("Content-Type").unwrap_or("");
+    if let Some(boundary) = content_type
+        .split(';')
+        .map(str::trim)
+        .find_map(|part| part.strip_prefix("boundary="))
+    {
+        return parse_multipart_upload(&request.body, boundary.trim_matches('"'));
+    }
+
+    let form = String::from_utf8_lossy(&request.body);
+    Ok(UploadRequest {
+        path: form_value(&form, "path").unwrap_or_else(|| "/".to_string()),
+        filename: form_value(&form, "filename").unwrap_or_default(),
+        contents: form_value(&form, "contents")
+            .unwrap_or_default()
+            .into_bytes(),
+    })
+}
+
+fn parse_multipart_upload(body: &[u8], boundary: &str) -> io::Result<UploadRequest> {
+    let boundary = format!("--{boundary}").into_bytes();
+    let mut path = None;
+    let mut filename = None;
+    let mut contents = None;
+
+    for raw_part in split_bytes(body, &boundary).into_iter().skip(1) {
+        let mut part = raw_part;
+        if part.starts_with(b"\r\n") {
+            part = &part[2..];
+        }
+        if part.starts_with(b"--") {
+            break;
+        }
+
+        let Some(separator) = find_bytes(part, b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&part[..separator]);
+        let mut value = &part[separator + 4..];
+        if value.ends_with(b"\r\n") {
+            value = &value[..value.len() - 2];
+        }
+        let disposition = headers
+            .lines()
+            .find(|line| {
+                line.to_ascii_lowercase()
+                    .starts_with("content-disposition:")
+            })
+            .unwrap_or("");
+        let Some(name) = multipart_disposition_value(disposition, "name") else {
+            continue;
+        };
+
+        match name.as_str() {
+            "path" => path = Some(String::from_utf8_lossy(value).to_string()),
+            "file" => {
+                filename = multipart_disposition_value(disposition, "filename").and_then(|name| {
+                    Path::new(&name)
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                });
+                contents = Some(value.to_vec());
+            }
+            _ => {}
+        }
+    }
+
+    Ok(UploadRequest {
+        path: path.unwrap_or_else(|| "/".to_string()),
+        filename: filename.unwrap_or_default(),
+        contents: contents.unwrap_or_default(),
+    })
+}
+
+fn split_bytes<'a>(input: &'a [u8], delimiter: &[u8]) -> Vec<&'a [u8]> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    while let Some(offset) = find_bytes(&input[start..], delimiter) {
+        parts.push(&input[start..start + offset]);
+        start += offset + delimiter.len();
+    }
+    parts.push(&input[start..]);
+    parts
+}
+
+fn find_bytes(input: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > input.len() {
+        return None;
+    }
+    input
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn multipart_disposition_value(header: &str, key: &str) -> Option<String> {
+    header.split(';').map(str::trim).find_map(|part| {
+        let (name, value) = part.split_once('=')?;
+        if name == key {
+            Some(value.trim_matches('"').to_string())
+        } else {
+            None
+        }
+    })
 }
 
 fn folder_from_url_path(root: &Path, url_path: &str) -> io::Result<PathBuf> {
@@ -2254,6 +2427,59 @@ fn folder_form_html(path: &str, error: Option<&str>) -> String {
     );
     body.push_str(&escape_html(path));
     body.push_str("\"><label>Folder name<input name=\"name\" required></label><label>Parent read+write PIN <span>required when creating inside a protected folder</span><input name=\"parent_pin\" type=\"password\"></label><label>Recovery passcode<input name=\"recovery\" type=\"password\" required></label><label>Read PIN <span>optional for sharing downloads</span><input name=\"read_pin\" type=\"password\"></label><label>Read+write PIN <span>required for owner access</span><input name=\"write_pin\" type=\"password\" required></label><button type=\"submit\">Create folder</button></form><p class=\"muted\">The recovery passcode is required to change this folder's PINs later.</p></section></main></body></html>");
+    body
+}
+
+fn upload_error_html(path: &str, error: &str) -> String {
+    let mut body = String::new();
+    body.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Upload failed</title><style>");
+    body.push_str(DIRECTORY_CSS);
+    body.push_str(FORM_CSS);
+    body.push_str("</style></head><body><main class=\"form-page\"><section class=\"panel\"><p class=\"eyebrow\">Splinterparty</p><h1>Upload failed</h1><p class=\"error\">");
+    body.push_str(&escape_html(error));
+    body.push_str("</p><p><a class=\"up\" href=\"");
+    body.push_str(&escape_html(path));
+    body.push_str("\">Back to folder</a></p></section></main></body></html>");
+    body
+}
+
+fn write_permission_message(path: &str, error: &io::Error) -> String {
+    if error.kind() == io::ErrorKind::PermissionDenied {
+        format!(
+            "The server process cannot write to {path}. Choose a writable served directory or change the folder permissions."
+        )
+    } else {
+        format!("The server could not write to {path}: {error}.")
+    }
+}
+
+fn directory_writable(path: &Path) -> bool {
+    let probe = path.join(".splinterparty-write-test");
+    match File::create(&probe) {
+        Ok(_) => {
+            let _ = fs::remove_file(probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn folder_only_html(path: &str) -> String {
+    folder_operation_error_html(path, "Only folders can have PINs or contain new folders.")
+}
+
+fn folder_operation_error_html(path: &str, error: &str) -> String {
+    let mut body = String::new();
+    body.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Folder error</title><style>");
+    body.push_str(DIRECTORY_CSS);
+    body.push_str(FORM_CSS);
+    body.push_str("</style></head><body><main class=\"form-page\"><section class=\"panel\"><p class=\"eyebrow\">Splinterparty</p><h1>Folder error</h1><p class=\"muted\">");
+    body.push_str(&escape_html(path));
+    body.push_str("</p><p class=\"error\">");
+    body.push_str(&escape_html(error));
+    body.push_str("</p><p class=\"muted\">If this is a permission problem, make sure the OS user running Splinterparty can write to the served directory.</p><p><a class=\"up\" href=\"");
+    body.push_str(&escape_html(path));
+    body.push_str("\">Back</a></p></section></main></body></html>");
     body
 }
 
@@ -2473,7 +2699,9 @@ fn serve_directory(
         body.push_str("<div class=\"empty\">This directory is empty.</div>");
     }
 
-    body.push_str("</section></main></body></html>\n");
+    body.push_str("</section><section class=\"upload-panel\"><h2>Upload file</h2><form method=\"post\" action=\"/__upload\" enctype=\"multipart/form-data\"><input type=\"hidden\" name=\"path\" value=\"");
+    body.push_str(&escape_html(&url_path_for(root, path)));
+    body.push_str("\"><label>File<input name=\"file\" type=\"file\" required></label><button type=\"submit\">Upload</button></form></section></main></body></html>\n");
 
     write_text_response(
         stream,
@@ -2718,23 +2946,6 @@ mod tests {
     }
 
     #[test]
-    fn mount_paths_decode_proc_mount_escapes() {
-        assert_eq!(
-            decode_mount_path("/media/My\\040Drive/backup\\134set"),
-            "/media/My Drive/backup\\set"
-        );
-    }
-
-    #[test]
-    fn mount_filter_keeps_user_storage_locations() {
-        assert!(should_show_mount("/", "ext4"));
-        assert!(should_show_mount("/mnt/archive", "ext4"));
-        assert!(should_show_mount("/media/usb", "vfat"));
-        assert!(!should_show_mount("/proc", "proc"));
-        assert!(!should_show_mount("/run", "tmpfs"));
-    }
-
-    #[test]
     fn base64_decoder_handles_basic_auth_payloads() {
         assert_eq!(
             base64_decode("c3BsaW50ZXI6c2VjcmV0"),
@@ -2845,9 +3056,21 @@ mod tests {
     }
 
     #[test]
+    fn multipart_upload_parser_keeps_device_file_bytes() {
+        let body = b"--boundary\r\nContent-Disposition: form-data; name=\"path\"\r\n\r\n/uploads\r\n--boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"photo.bin\"\r\nContent-Type: application/octet-stream\r\n\r\nabc\x00\xff\r\n--boundary--\r\n";
+
+        let upload = parse_multipart_upload(body, "boundary").unwrap();
+
+        assert_eq!(upload.path, "/uploads");
+        assert_eq!(upload.filename, "photo.bin");
+        assert_eq!(upload.contents, b"abc\x00\xff");
+    }
+
+    #[test]
     fn safe_folder_names_reject_path_tricks() {
         assert!(is_safe_folder_name("photos"));
         assert!(is_safe_folder_name("my folder"));
+        assert!(is_safe_folder_name("upload.txt"));
         assert!(!is_safe_folder_name(""));
         assert!(!is_safe_folder_name("."));
         assert!(!is_safe_folder_name(".."));

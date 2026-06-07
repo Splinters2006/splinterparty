@@ -12,7 +12,7 @@ cargo run -- setup
 
 Setup asks for:
 
-- the directory or mounted partition to serve
+- the directory path to serve
 - the bind address, defaulting to `0.0.0.0:8080`
 - whether to configure router port forwarding through UPnP
 - whether to require username and password authentication
@@ -47,7 +47,7 @@ File responses include weak ETags and support `If-None-Match`, so clients can av
 
 Directory pages render a built-in browser UI with item counts, file types, sizes, modified times, large-file labels, and download links.
 
-The browser UI can create protected folders and upload files from your device. Uploading into a protected folder requires that folder's read+write PIN.
+The browser UI can create protected folders and upload files from your device. Files do not have their own PINs; uploading into a protected folder requires that directory to be unlocked with its read+write PIN.
 
 ## Commands
 
