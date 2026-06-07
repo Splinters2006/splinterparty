@@ -760,6 +760,12 @@ fn hash_file(path: &Path) -> io::Result<String> {
     Ok(hex_bytes(&hasher.finish()))
 }
 
+fn hash_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex_bytes(&hasher.finish())
+}
+
 fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
@@ -2203,16 +2209,20 @@ fn handle_upload_route(
         }
     }
 
-    let target = folder.join(&filename);
-    if target.exists() {
-        return write_html_response(
-            stream,
-            "409 Conflict",
-            &upload_error_html(&path, "A file with that name already exists."),
-            &[],
-            false,
-        );
-    }
+    let upload_hash = hash_bytes(&contents);
+    let target = match unique_upload_target(&folder, &filename, &upload_hash) {
+        Ok(target) => target,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return write_html_response(
+                stream,
+                "409 Conflict",
+                &upload_error_html(&path, "That exact file already exists."),
+                &[],
+                false,
+            );
+        }
+        Err(error) => return Err(error),
+    };
 
     if let Err(error) = fs::write(&target, &contents) {
         return write_html_response(
@@ -2238,10 +2248,22 @@ fn handle_delete_route(
     request: &Request,
 ) -> io::Result<()> {
     if request.method == "GET" {
-        let path = request
+        let url_path = request
             .query_value("path")
             .unwrap_or_else(|| "/".to_string());
-        return write_html_response(stream, "200 OK", &delete_form_html(&path, None), &[], false);
+        let require_pin = match delete_target(&config.root, &url_path) {
+            Ok((path, metadata)) => {
+                find_applicable_share(&config.root, &path, &metadata)?.is_some()
+            }
+            Err(_) => true,
+        };
+        return write_html_response(
+            stream,
+            "200 OK",
+            &delete_form_html(&url_path, None, require_pin),
+            &[],
+            false,
+        );
     }
 
     if request.method != "POST" {
@@ -2258,48 +2280,36 @@ fn handle_delete_route(
     let url_path = form_value(&form, "path").unwrap_or_else(|| "/".to_string());
     let pin = form_value(&form, "pin").unwrap_or_default();
 
-    let requested_path = match path_for_request(&config.root, &url_path) {
-        Some(path) => path,
-        None => {
+    let (path, metadata) = match delete_target(&config.root, &url_path) {
+        Ok(target) => target,
+        Err(error) => {
+            let (status, message) = match error.kind() {
+                io::ErrorKind::InvalidInput => ("400 Bad Request", "Bad request path."),
+                io::ErrorKind::NotFound => ("404 Not Found", "File not found."),
+                io::ErrorKind::PermissionDenied => {
+                    ("403 Forbidden", "Path escapes served directory.")
+                }
+                _ => return Err(error),
+            };
             return write_html_response(
                 stream,
-                "400 Bad Request",
-                &delete_form_html(&url_path, Some("Bad request path.")),
+                status,
+                &delete_form_html(&url_path, Some(message), true),
                 &[],
                 false,
             );
         }
     };
 
-    let path = match contained_path(&config.root, &requested_path) {
-        Ok(path) => path,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return write_html_response(
-                stream,
-                "404 Not Found",
-                &delete_form_html(&url_path, Some("File not found.")),
-                &[],
-                false,
-            );
-        }
-        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-            return write_html_response(
-                stream,
-                "403 Forbidden",
-                &delete_form_html(&url_path, Some("Path escapes served directory.")),
-                &[],
-                false,
-            );
-        }
-        Err(error) => return Err(error),
-    };
-
-    let metadata = fs::metadata(&path)?;
     if !metadata.is_file() {
         return write_html_response(
             stream,
             "400 Bad Request",
-            &delete_form_html(&url_path, Some("Only files can be deleted from this page.")),
+            &delete_form_html(
+                &url_path,
+                Some("Only files can be deleted from this page."),
+                true,
+            ),
             &[],
             false,
         );
@@ -2315,36 +2325,32 @@ fn handle_delete_route(
             &delete_form_html(
                 &url_path,
                 Some("Internal Splinterparty files cannot be deleted."),
+                true,
             ),
             &[],
             false,
         );
     }
 
-    let Some((_share_dir, share)) = find_applicable_share(&config.root, &path, &metadata)? else {
-        return write_html_response(
-            stream,
-            "403 Forbidden",
-            &delete_form_html(
-                &url_path,
-                Some(
-                    "This file is not inside a protected share, so there is no read+write PIN to verify.",
-                ),
-            ),
-            &[],
-            false,
-        );
-    };
-
-    if !share.allows_write(Some(&pin)) {
-        return write_html_response(
-            stream,
-            "403 Forbidden",
-            &delete_form_html(&url_path, Some("Read+write PIN required or incorrect.")),
-            &[],
-            false,
-        );
-    }
+    let require_pin =
+        if let Some((_share_dir, share)) = find_applicable_share(&config.root, &path, &metadata)? {
+            if !share.allows_write(Some(&pin)) {
+                return write_html_response(
+                    stream,
+                    "403 Forbidden",
+                    &delete_form_html(
+                        &url_path,
+                        Some("Read+write PIN required or incorrect."),
+                        true,
+                    ),
+                    &[],
+                    false,
+                );
+            }
+            true
+        } else {
+            false
+        };
 
     if let Err(error) = fs::remove_file(&path) {
         return write_html_response(
@@ -2356,6 +2362,7 @@ fn handle_delete_route(
                     "Could not delete file. {}",
                     write_permission_message(&url_path, &error)
                 )),
+                require_pin,
             ),
             &[],
             false,
@@ -2367,6 +2374,14 @@ fn handle_delete_route(
         .map(|parent| url_path_for(&config.root, parent))
         .unwrap_or_else(|| "/".to_string());
     write_redirect_with_cookie(stream, &parent_path, PIN_COOKIE, &pin)
+}
+
+fn delete_target(root: &Path, url_path: &str) -> io::Result<(PathBuf, fs::Metadata)> {
+    let requested_path = path_for_request(root, url_path)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad request path"))?;
+    let path = contained_path(root, &requested_path)?;
+    let metadata = fs::metadata(&path)?;
+    Ok((path, metadata))
 }
 
 // ── Chunked upload state ──────────────────────────────────────────────────────
@@ -2548,17 +2563,8 @@ fn handle_chunk_route(
     let temp_dir = folder.join(&temp_dir_name);
     let state_path = temp_dir.join(UPLOAD_FILE);
 
-    // Check for a conflicting finished file
-    let final_target = folder.join(&chunk_req.filename);
-    if final_target.exists() {
-        return write_text_response(
-            stream,
-            "409 Conflict",
-            "A file with that name already exists.\n",
-            &[],
-            false,
-        );
-    }
+    // The final path is selected after assembly. A same-name upload is allowed
+    // when the bytes are different; it will get a numbered filename.
 
     // Load or create state
     let mut state = if state_path.exists() {
@@ -2616,6 +2622,25 @@ fn handle_chunk_route(
                 io::copy(&mut part_file, &mut out)?;
             }
         }
+
+        let assembled_hash = hash_file(&temp_output)?;
+        let final_target = match unique_upload_target(&folder, &chunk_req.filename, &assembled_hash)
+        {
+            Ok(target) => target,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let _ = fs::remove_file(&temp_output);
+                let _ = fs::remove_dir_all(&temp_dir);
+                return write_text_response(
+                    stream,
+                    "409 Conflict",
+                    "That exact file already exists.\n",
+                    &[],
+                    false,
+                );
+            }
+            Err(error) => return Err(error),
+        };
+
         fs::rename(&temp_output, &final_target)?;
         // Clean up temp directory
         let _ = fs::remove_dir_all(&temp_dir);
@@ -2920,7 +2945,7 @@ fn folder_form_html(path: &str, error: Option<&str>) -> String {
     body
 }
 
-fn delete_form_html(path: &str, error: Option<&str>) -> String {
+fn delete_form_html(path: &str, error: Option<&str>, require_pin: bool) -> String {
     let mut body = String::new();
     body.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Delete file</title><style>");
     body.push_str(DIRECTORY_CSS);
@@ -2937,7 +2962,15 @@ fn delete_form_html(path: &str, error: Option<&str>) -> String {
         "<form method=\"post\" action=\"/__delete\"><input type=\"hidden\" name=\"path\" value=\"",
     );
     body.push_str(&escape_html(path));
-    body.push_str("\"><label>Read+write PIN<input name=\"pin\" type=\"password\" autofocus required></label><button type=\"submit\">Delete file</button></form><p class=\"muted\">This permanently removes the file from the server directory.</p><p><a class=\"up\" href=\"");
+    body.push_str("\">");
+    if require_pin {
+        body.push_str("<label>Read+write PIN<input name=\"pin\" type=\"password\" autofocus required></label>");
+    } else {
+        body.push_str(
+            "<p class=\"muted\">This file is outside a protected share, so no PIN is required.</p>",
+        );
+    }
+    body.push_str("<button type=\"submit\">Delete file</button></form><p class=\"muted\">This permanently removes the file from the server directory.</p><p><a class=\"up\" href=\"");
     let parent = path
         .trim_end_matches('/')
         .rsplit_once('/')
@@ -2946,6 +2979,45 @@ fn delete_form_html(path: &str, error: Option<&str>) -> String {
     body.push_str(&escape_html(parent));
     body.push_str("\">Cancel</a></p></section></main></body></html>");
     body
+}
+
+fn unique_upload_target(folder: &Path, filename: &str, content_hash: &str) -> io::Result<PathBuf> {
+    for index in 0..10_000_u32 {
+        let candidate_name = numbered_filename(filename, index);
+        let candidate = folder.join(&candidate_name);
+
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+
+        let metadata = fs::metadata(&candidate)?;
+        if metadata.is_file() && hash_file(&candidate)? == content_hash {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "an identical file already exists",
+            ));
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not find an unused filename",
+    ))
+}
+
+fn numbered_filename(filename: &str, index: u32) -> String {
+    if index == 0 {
+        return filename.to_string();
+    }
+
+    let path = Path::new(filename);
+    let stem = path.file_stem().and_then(OsStr::to_str).unwrap_or(filename);
+    let extension = path.extension().and_then(OsStr::to_str);
+
+    match extension {
+        Some(extension) if !extension.is_empty() => format!("{stem} ({index}).{extension}"),
+        _ => format!("{stem} ({index})"),
+    }
 }
 
 fn upload_error_html(path: &str, error: &str) -> String {

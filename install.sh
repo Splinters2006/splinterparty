@@ -24,11 +24,22 @@ fi
 if ! command -v cargo >/dev/null 2>&1; then
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
     . "$HOME/.cargo/env"
+elif [ -f "$HOME/.cargo/env" ]; then
+    . "$HOME/.cargo/env"
 fi
 
 cargo build --release
 
+INSTALL_DIR="$HOME/.local/bin"
+INSTALL_BIN="$INSTALL_DIR/splinterparty"
+mkdir -p "$INSTALL_DIR"
+cp "target/release/splinterparty" "$INSTALL_BIN"
+chmod +x "$INSTALL_BIN"
+
 echo
-echo "Splinterparty installed."
+echo "Splinterparty installed to $INSTALL_BIN."
 echo "Run setup with:"
-echo "  cargo run --release -- setup"
+echo "  $INSTALL_BIN setup"
+echo
+echo "Then install/start the user service with:"
+echo "  ./service.sh install"
