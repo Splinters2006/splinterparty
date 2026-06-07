@@ -38,6 +38,43 @@ a { color: #155eef; text-decoration: none; }
 a:hover { text-decoration: underline; }
 .up { display: inline-flex; align-items: center; min-height: 34px; padding: 0 12px; border: 1px solid #cbd5e1; border-radius: 8px; background: #ffffff; color: #1f2937; font-weight: 650; }
 .browser { overflow: hidden; border: 1px solid #d9dee7; border-radius: 8px; background: #ffffff; }
+.browser-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid #edf0f4;
+  background: #ffffff;
+}
+
+.browser-top-title {
+  font-size: 14px;
+  font-weight: 800;
+  color: #1f2937;
+}
+
+.plus-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid #cbd5e1;
+  border-radius: 999px;
+  background: #155eef;
+  color: #ffffff;
+  font-size: 24px;
+  font-weight: 750;
+  line-height: 1;
+  text-decoration: none;
+}
+
+.plus-button:hover {
+  text-decoration: none;
+  background: #0f49c7;
+}
+...
 .row { display: grid; grid-template-columns: minmax(220px, 1fr) 120px 110px 160px; gap: 14px; align-items: center; min-height: 52px; padding: 0 16px; border-top: 1px solid #edf0f4; }
 .row:first-child { border-top: 0; }
 .row.head { min-height: 38px; background: #f1f4f8; color: #53606f; font-size: 12px; font-weight: 750; text-transform: uppercase; }
