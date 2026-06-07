@@ -2232,9 +2232,7 @@ fn handle_symlink_route(
         .unwrap_or_default()
         .trim()
         .to_string();
-    let parent_pin = form_value(&form, "parent_pin")
-        .filter(|pin| !pin.is_empty())
-        .or_else(|| request_pin(request));
+    let parent_pin = request_pin(request);
     let target_pin = form_value(&form, "target_pin")
         .filter(|pin| !pin.is_empty())
         .or_else(|| request_pin(request));
@@ -3431,7 +3429,7 @@ fn symlink_form_html_with_values(
     body.push_str(&escape_html(name));
     body.push_str(r#""></label><label>Target path <span>existing file/folder on this Splinterparty instance, example: /family/shared.pdf</span><input name="target_path" required placeholder="/family/shared.pdf" value=""#);
     body.push_str(&escape_html(target_path));
-    body.push_str(r#""></label><label>Parent read+write PIN <span>required when creating inside a protected folder</span><input name="parent_pin" type="password"></label><label>Target read PIN <span>required if the target is inside a protected folder</span><input name="target_pin" type="password"></label><button type="submit">Create symlink</button></form><p class="muted">A symlink points to an existing file or folder on this same server, so the file is not stored twice. Symlinks are only allowed when their resolved target stays inside the served Splinterparty root.</p><p><a class="up" href=""#);
+    body.push_str(r#""></label><label>Target read PIN <span>required if the target is inside a protected folder</span><input name="target_pin" type="password"></label><button type="submit">Create symlink</button></form><p class="muted">A symlink points to an existing file or folder on this same server, so the file is not stored twice. Symlinks are only allowed when their resolved target stays inside the served Splinterparty root.</p><p><a class="up" href=""#);
     body.push_str(&escape_html(path));
     body.push_str(r#"">Cancel</a></p></section></main></body></html>"#);
     body
@@ -3857,7 +3855,7 @@ fn serve_directory(
                     body.push_str(&escape_html(&link.name));
                     body.push_str(r#"" data-path=""#);
                     body.push_str(&escape_html(&href));
-                    body.push_str(r#"" data-is-dir="0"><a class="name" href=""#);
+                    body.push_str(r#"" data-is-dir="0" data-download="1"><a class="name" href=""#);
                     body.push_str(&escape_html(&href));
                     body.push_str(r#""><span class="icon">NET</span><span>"#);
                     body.push_str(&escape_html(&link.name));
@@ -3905,6 +3903,8 @@ fn serve_directory(
         body.push_str(&escape_html(&item_url_path));
         body.push_str("\" data-is-dir=\"");
         body.push_str(if is_dir { "1" } else { "0" });
+        body.push_str("\" data-download=\"");
+        body.push_str(if !is_dir { "1" } else { "0" });
         body.push_str("\"><a class=\"name\" href=\"");
         body.push_str(&href);
         body.push_str("\"><span class=\"icon\">");
@@ -4013,11 +4013,13 @@ fn serve_directory(
     body.push_str(
         r##"<div id="context-menu" class="context-menu">
     <a id="ctx-open" href="#">Open</a>
+    <a id="ctx-download" href="#" download>Download</a>
     <button id="ctx-symlink" type="button">Create symlink here…</button>
+    <a id="ctx-delete" class="danger" href="#">Delete…</a>
     </div>"##,
     );
     body.push_str("<script>");
-    body.push_str("(function(){const menu=document.getElementById('context-menu');if(!menu)return;let current=null;const open=document.getElementById('ctx-open');const sym=document.getElementById('ctx-symlink');function hide(){menu.style.display='none';}document.addEventListener('click',hide);document.addEventListener('keydown',e=>{if(e.key==='Escape')hide();});document.querySelectorAll('.row.item').forEach(row=>{row.addEventListener('contextmenu',e=>{e.preventDefault();current=row;const path=row.dataset.path;open.href=path;menu.style.left=Math.min(e.clientX,window.innerWidth-210)+'px';menu.style.top=Math.min(e.clientY,window.innerHeight-120)+'px';menu.style.display='block';});});sym.addEventListener('click',()=>{if(!current)return;hide();const target=current.dataset.path;const defaultName=current.dataset.name||'link';const dest=prompt('Create symlink in which folder?', '");
+    body.push_str("(function(){const menu=document.getElementById('context-menu');if(!menu)return;let current=null;const open=document.getElementById('ctx-open');const down=document.getElementById('ctx-download');const del=document.getElementById('ctx-delete');const sym=document.getElementById('ctx-symlink');function hide(){menu.style.display='none';}document.addEventListener('click',hide);document.addEventListener('keydown',e=>{if(e.key==='Escape')hide();});document.querySelectorAll('.row.item').forEach(row=>{row.addEventListener('contextmenu',e=>{e.preventDefault();current=row;const path=row.dataset.path;open.href=path;down.href=path;down.style.display=row.dataset.download==='1'?'block':'none';del.href='/__delete?path='+encodeURIComponent(path);menu.style.left=Math.min(e.clientX,window.innerWidth-210)+'px';menu.style.top=Math.min(e.clientY,window.innerHeight-170)+'px';menu.style.display='block';});});sym.addEventListener('click',()=>{if(!current)return;hide();const target=current.dataset.path;const defaultName=current.dataset.name||'link';const dest=prompt('Create symlink in which folder?', '");
     body.push_str(&folder_url_path);
     body.push_str("');if(dest===null)return;const name=prompt('Symlink name:', defaultName);if(!name)return;const params=new URLSearchParams({path:dest,target_path:target,name:name});window.location.href='/__symlink?'+params.toString();});})();");
     body.push_str("</script>");
