@@ -28,6 +28,10 @@ h1 { margin: 0; font-size: 30px; line-height: 1.2; overflow-wrap: anywhere; }
 .summary { min-width: 88px; padding: 12px 14px; border: 1px solid #d9dee7; border-radius: 8px; background: #ffffff; text-align: right; }
 .summary span { display: block; font-size: 24px; font-weight: 750; }
 .summary small { color: #657386; }
+.remote-card { display: grid; gap: 6px; margin: 0 0 14px; padding: 14px 16px; border: 1px solid #d9dee7; border-radius: 8px; background: #ffffff; }
+.remote-card strong { font-size: 14px; }
+.remote-card code { display: inline-block; width: fit-content; max-width: 100%; padding: 4px 7px; border-radius: 6px; background: #eef2ff; color: #1e3a8a; overflow-wrap: anywhere; }
+.remote-card small { color: #657386; }
 nav { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 12px; }
 a { color: #155eef; text-decoration: none; }
 a:hover { text-decoration: underline; }
@@ -1202,6 +1206,25 @@ fn local_lan_addr() -> io::Result<String> {
     Ok(socket.local_addr()?.ip().to_string())
 }
 
+fn tailscale_remote_url(port: u16) -> Option<String> {
+    let output = std::process::Command::new("tailscale")
+        .args(["ip", "-4"])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let ip = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?
+        .to_string();
+
+    Some(format!("http://{ip}:{port}"))
+}
+
 fn discover_gateway() -> io::Result<Gateway> {
     let socket = UdpSocket::bind("0.0.0.0:0")?;
     socket.set_read_timeout(Some(Duration::from_secs(3)))?;
@@ -1520,7 +1543,13 @@ fn handle_connection(mut stream: TcpStream, config: &Config) -> io::Result<()> {
 
     if metadata.is_dir() {
         log_request(&peer, &request, "200");
-        return serve_directory(&mut stream, &config.root, &path, request.method == "HEAD");
+        return serve_directory(
+            &mut stream,
+            &config.root,
+            &path,
+            config.port(),
+            request.method == "HEAD",
+        );
     }
 
     if metadata.is_file() {
@@ -3177,6 +3206,7 @@ fn serve_directory(
     stream: &mut TcpStream,
     root: &Path,
     path: &Path,
+    bind_port: u16,
     skip_body: bool,
 ) -> io::Result<()> {
     let mut entries = fs::read_dir(path)?
@@ -3220,6 +3250,14 @@ fn serve_directory(
     body.push_str("</h1></div><div class=\"summary\"><span>");
     body.push_str(&entry_count.to_string());
     body.push_str("</span><small>items</small></div></header>");
+
+    if let Some(remote_url) = tailscale_remote_url(bind_port) {
+        body.push_str(
+            "<section class=\"remote-card\"><strong>Tailscale remote access</strong><code>",
+        );
+        body.push_str(&escape_html(&remote_url));
+        body.push_str("</code><small>Open this URL from another device connected to the same Tailscale network.</small></section>");
+    }
 
     body.push_str("<nav>");
     if !relative.as_os_str().is_empty() {
