@@ -38,7 +38,7 @@ a { color: #155eef; text-decoration: none; }
 a:hover { text-decoration: underline; }
 .up { display: inline-flex; align-items: center; min-height: 34px; padding: 0 12px; border: 1px solid #cbd5e1; border-radius: 8px; background: #ffffff; color: #1f2937; font-weight: 650; }
 .browser { overflow: hidden; border: 1px solid #d9dee7; border-radius: 8px; background: #ffffff; }
-.row { display: grid; grid-template-columns: minmax(220px, 1fr) 120px 110px 160px 100px; gap: 14px; align-items: center; min-height: 52px; padding: 0 16px; border-top: 1px solid #edf0f4; }
+.row { display: grid; grid-template-columns: minmax(220px, 1fr) 120px 110px 160px; gap: 14px; align-items: center; min-height: 52px; padding: 0 16px; border-top: 1px solid #edf0f4; }
 .row:first-child { border-top: 0; }
 .row.head { min-height: 38px; background: #f1f4f8; color: #53606f; font-size: 12px; font-weight: 750; text-transform: uppercase; }
 .name { display: inline-flex; align-items: center; gap: 10px; min-width: 0; color: #111827; font-weight: 650; overflow-wrap: anywhere; }
@@ -2201,10 +2201,12 @@ fn handle_symlink_route(
         let path = request
             .query_value("path")
             .unwrap_or_else(|| "/".to_string());
+        let target_path = request.query_value("target_path").unwrap_or_default();
+        let name = request.query_value("name").unwrap_or_default();
         return write_html_response(
             stream,
             "200 OK",
-            &symlink_form_html(&path, None),
+            &symlink_form_html_with_values(&path, None, &target_path, &name),
             &[],
             false,
         );
@@ -2263,14 +2265,11 @@ fn handle_symlink_route(
         );
     }
 
-    if !target_path.starts_with('/') || target_path.contains("..") {
+    if !target_path.starts_with('/') {
         return write_html_response(
             stream,
             "400 Bad Request",
-            &symlink_form_html(
-                &parent_path,
-                Some("Target path must start with / and cannot contain '..'."),
-            ),
+            &symlink_form_html(&parent_path, Some("Target path must start with /.")),
             &[],
             false,
         );
@@ -3403,6 +3402,15 @@ fn folder_form_html(path: &str, error: Option<&str>) -> String {
 }
 
 fn symlink_form_html(path: &str, error: Option<&str>) -> String {
+    symlink_form_html_with_values(path, error, "", "")
+}
+
+fn symlink_form_html_with_values(
+    path: &str,
+    error: Option<&str>,
+    target_path: &str,
+    name: &str,
+) -> String {
     let mut body = String::new();
     body.push_str(r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>New symlink</title><style>"#);
     body.push_str(DIRECTORY_CSS);
@@ -3419,7 +3427,11 @@ fn symlink_form_html(path: &str, error: Option<&str>) -> String {
         r#"<form method="post" action="/__symlink"><input type="hidden" name="path" value=""#,
     );
     body.push_str(&escape_html(path));
-    body.push_str(r#""><label>Symlink name <span>shown in this folder</span><input name="name" required placeholder="doc1.pdf"></label><label>Target path <span>existing file/folder on this Splinterparty instance, example: /family/shared.pdf</span><input name="target_path" required placeholder="/family/shared.pdf"></label><label>Parent read+write PIN <span>required when creating inside a protected folder</span><input name="parent_pin" type="password"></label><label>Target read PIN <span>required if the target is inside a protected folder</span><input name="target_pin" type="password"></label><button type="submit">Create symlink</button></form><p class="muted">A symlink points to an existing file or folder on this same server, so the file is not stored twice. Symlinks are only allowed when their resolved target stays inside the served Splinterparty root.</p><p><a class="up" href=""#);
+    body.push_str(r#""><label>Symlink name <span>shown in this folder</span><input name="name" required placeholder="doc1.pdf" value=""#);
+    body.push_str(&escape_html(name));
+    body.push_str(r#""></label><label>Target path <span>existing file/folder on this Splinterparty instance, example: /family/shared.pdf</span><input name="target_path" required placeholder="/family/shared.pdf" value=""#);
+    body.push_str(&escape_html(target_path));
+    body.push_str(r#""></label><label>Parent read+write PIN <span>required when creating inside a protected folder</span><input name="parent_pin" type="password"></label><label>Target read PIN <span>required if the target is inside a protected folder</span><input name="target_pin" type="password"></label><button type="submit">Create symlink</button></form><p class="muted">A symlink points to an existing file or folder on this same server, so the file is not stored twice. Symlinks are only allowed when their resolved target stays inside the served Splinterparty root.</p><p><a class="up" href=""#);
     body.push_str(&escape_html(path));
     body.push_str(r#"">Cancel</a></p></section></main></body></html>"#);
     body
@@ -3832,7 +3844,7 @@ fn serve_directory(
     body.push_str(&url_encode_query_value(&url_path_for(root, path)));
     body.push_str("\">New symlink</a></nav>");
 
-    body.push_str("<section class=\"browser\"><div class=\"row head\"><span>Name</span><span>Type</span><span>Size</span><span>Modified</span><span></span></div>");
+    body.push_str("<section class=\"browser\"><div class=\"row head\"><span>Name</span><span>Type</span><span>Size</span><span>Modified</span></div>");
 
     for entry in entries {
         let name = entry.file_name();
@@ -3845,21 +3857,11 @@ fn serve_directory(
                     body.push_str(&escape_html(&link.name));
                     body.push_str(r#"" data-path=""#);
                     body.push_str(&escape_html(&href));
-                    body.push_str(r#"" data-is-dir="0" data-download="1"><a class="name" href=""#);
+                    body.push_str(r#"" data-is-dir="0"><a class="name" href=""#);
                     body.push_str(&escape_html(&href));
                     body.push_str(r#""><span class="icon">NET</span><span>"#);
                     body.push_str(&escape_html(&link.name));
-                    body.push_str(r#" ↗</span></a><span class="type">Remote link</span><span>-</span><span>-</span><span class="actions"><a href=""#);
-                    body.push_str(&escape_html(&href));
-                    body.push_str(r#"">Open</a> "#);
-                    let delete_path = format!(
-                        "{}/{}",
-                        url_path_for(root, path).trim_end_matches('/'),
-                        url_encode_path_segment(&name)
-                    );
-                    body.push_str(r#"<a href="/__delete?path="#);
-                    body.push_str(&url_encode_query_value(&delete_path));
-                    body.push_str(r#"">Delete</a></span></div>"#);
+                    body.push_str(r#" ↗</span></a><span class="type">Remote link</span><span>-</span><span>-</span></div>"#);
                     continue;
                 }
             }
@@ -3903,8 +3905,6 @@ fn serve_directory(
         body.push_str(&escape_html(&item_url_path));
         body.push_str("\" data-is-dir=\"");
         body.push_str(if is_dir { "1" } else { "0" });
-        body.push_str("\" data-download=\"");
-        body.push_str(if !is_dir { "1" } else { "0" });
         body.push_str("\"><a class=\"name\" href=\"");
         body.push_str(&href);
         body.push_str("\"><span class=\"icon\">");
@@ -3930,20 +3930,6 @@ fn serve_directory(
         body.push_str(&size_label);
         body.push_str("</span><span>");
         body.push_str(&modified);
-        body.push_str("</span><span class=\"actions\">");
-        if !is_dir {
-            body.push_str("<a href=\"");
-            body.push_str(&href);
-            body.push_str("\" download>Download</a> ");
-            let delete_path = format!(
-                "{}/{}",
-                url_path_for(root, path).trim_end_matches('/'),
-                url_encode_path_segment(&name)
-            );
-            body.push_str("<a href=\"/__delete?path=");
-            body.push_str(&url_encode_query_value(&delete_path));
-            body.push_str("\">Delete</a>");
-        }
         body.push_str("</span></div>");
     }
 
@@ -4027,15 +4013,13 @@ fn serve_directory(
     body.push_str(
         r##"<div id="context-menu" class="context-menu">
     <a id="ctx-open" href="#">Open</a>
-    <a id="ctx-download" href="#" download>Download</a>
     <button id="ctx-symlink" type="button">Create symlink here…</button>
-    <a id="ctx-delete" class="danger" href="#">Delete…</a>
     </div>"##,
     );
     body.push_str("<script>");
-    body.push_str("(function(){const menu=document.getElementById('context-menu');if(!menu)return;let current=null;const open=document.getElementById('ctx-open');const down=document.getElementById('ctx-download');const del=document.getElementById('ctx-delete');const sym=document.getElementById('ctx-symlink');function hide(){menu.style.display='none';}document.addEventListener('click',hide);document.addEventListener('keydown',e=>{if(e.key==='Escape')hide();});document.querySelectorAll('.row.item').forEach(row=>{row.addEventListener('contextmenu',e=>{e.preventDefault();current=row;const path=row.dataset.path;open.href=path;down.href=path;down.style.display=row.dataset.download==='1'?'block':'none';del.href='/__delete?path='+encodeURIComponent(path);menu.style.left=Math.min(e.clientX,window.innerWidth-210)+'px';menu.style.top=Math.min(e.clientY,window.innerHeight-170)+'px';menu.style.display='block';});});sym.addEventListener('click',()=>{if(!current)return;hide();const target=current.dataset.path;const defaultName=current.dataset.name||'link';const dest=prompt('Create symlink in which folder?', '");
+    body.push_str("(function(){const menu=document.getElementById('context-menu');if(!menu)return;let current=null;const open=document.getElementById('ctx-open');const sym=document.getElementById('ctx-symlink');function hide(){menu.style.display='none';}document.addEventListener('click',hide);document.addEventListener('keydown',e=>{if(e.key==='Escape')hide();});document.querySelectorAll('.row.item').forEach(row=>{row.addEventListener('contextmenu',e=>{e.preventDefault();current=row;const path=row.dataset.path;open.href=path;menu.style.left=Math.min(e.clientX,window.innerWidth-210)+'px';menu.style.top=Math.min(e.clientY,window.innerHeight-120)+'px';menu.style.display='block';});});sym.addEventListener('click',()=>{if(!current)return;hide();const target=current.dataset.path;const defaultName=current.dataset.name||'link';const dest=prompt('Create symlink in which folder?', '");
     body.push_str(&folder_url_path);
-    body.push_str("');if(dest===null)return;const name=prompt('Symlink name:', defaultName);if(!name)return;const form=document.createElement('form');form.method='post';form.action='/__symlink';[['path',dest],['target_path',target],['name',name]].forEach(([k,v])=>{const i=document.createElement('input');i.type='hidden';i.name=k;i.value=v;form.appendChild(i);});document.body.appendChild(form);form.submit();});})();");
+    body.push_str("');if(dest===null)return;const name=prompt('Symlink name:', defaultName);if(!name)return;const params=new URLSearchParams({path:dest,target_path:target,name:name});window.location.href='/__symlink?'+params.toString();});})();");
     body.push_str("</script>");
 
     body.push_str("</section></main></body></html>\n");
