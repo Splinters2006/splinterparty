@@ -1559,7 +1559,13 @@ fn handle_connection(mut stream: TcpStream, config: &Config) -> io::Result<()> {
 
     if metadata.is_dir() {
         log_request(&peer, &request, "200");
-        return serve_directory(&mut stream, &config.root, &path, config.port(), request.method == "HEAD");
+        return serve_directory(
+            &mut stream,
+            &config.root,
+            &path,
+            config.port(),
+            request.method == "HEAD",
+        );
     }
 
     if metadata.is_file() {
@@ -2186,7 +2192,6 @@ fn handle_folder_route(
     write_redirect_with_cookie(stream, &new_path, PIN_COOKIE, &write_pin)
 }
 
-
 fn handle_symlink_route(
     stream: &mut TcpStream,
     config: &Config,
@@ -2196,7 +2201,13 @@ fn handle_symlink_route(
         let path = request
             .query_value("path")
             .unwrap_or_else(|| "/".to_string());
-        return write_html_response(stream, "200 OK", &symlink_form_html(&path, None), &[], false);
+        return write_html_response(
+            stream,
+            "200 OK",
+            &symlink_form_html(&path, None),
+            &[],
+            false,
+        );
     }
 
     if request.method != "POST" {
@@ -2211,8 +2222,14 @@ fn handle_symlink_route(
 
     let form = String::from_utf8_lossy(&request.body);
     let parent_path = form_value(&form, "path").unwrap_or_else(|| "/".to_string());
-    let link_name = form_value(&form, "name").unwrap_or_default().trim().to_string();
-    let target_path = form_value(&form, "target_path").unwrap_or_default().trim().to_string();
+    let link_name = form_value(&form, "name")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let target_path = form_value(&form, "target_path")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     let parent_pin = form_value(&form, "parent_pin")
         .filter(|pin| !pin.is_empty())
         .or_else(|| request_pin(request));
@@ -2221,56 +2238,139 @@ fn handle_symlink_route(
         .or_else(|| request_pin(request));
 
     if link_name.is_empty() || target_path.is_empty() {
-        return write_html_response(stream, "400 Bad Request", &symlink_form_html(&parent_path, Some("Link name and target path are required.")), &[], false);
+        return write_html_response(
+            stream,
+            "400 Bad Request",
+            &symlink_form_html(
+                &parent_path,
+                Some("Link name and target path are required."),
+            ),
+            &[],
+            false,
+        );
     }
 
     if !is_safe_symlink_name(&link_name) {
-        return write_html_response(stream, "400 Bad Request", &symlink_form_html(&parent_path, Some("Link name cannot contain path separators or internal Splinterparty names.")), &[], false);
+        return write_html_response(
+            stream,
+            "400 Bad Request",
+            &symlink_form_html(
+                &parent_path,
+                Some("Link name cannot contain path separators or internal Splinterparty names."),
+            ),
+            &[],
+            false,
+        );
     }
 
     if !target_path.starts_with('/') || target_path.contains("..") {
-        return write_html_response(stream, "400 Bad Request", &symlink_form_html(&parent_path, Some("Target path must start with / and cannot contain '..'.")), &[], false);
+        return write_html_response(
+            stream,
+            "400 Bad Request",
+            &symlink_form_html(
+                &parent_path,
+                Some("Target path must start with / and cannot contain '..'."),
+            ),
+            &[],
+            false,
+        );
     }
 
     let parent = match folder_from_url_path(&config.root, &parent_path) {
         Ok(parent) => parent,
         Err(error) => {
-            return write_html_response(stream, "400 Bad Request", &symlink_form_html(&parent_path, Some(&format!("Could not open parent folder: {error}."))), &[], false);
+            return write_html_response(
+                stream,
+                "400 Bad Request",
+                &symlink_form_html(
+                    &parent_path,
+                    Some(&format!("Could not open parent folder: {error}.")),
+                ),
+                &[],
+                false,
+            );
         }
     };
 
     let parent_metadata = fs::metadata(&parent)?;
-    if let Some((_share_dir, share)) = find_applicable_share(&config.root, &parent, &parent_metadata)? {
+    if let Some((_share_dir, share)) =
+        find_applicable_share(&config.root, &parent, &parent_metadata)?
+    {
         if !share.allows_write(parent_pin.as_deref()) {
-            return write_html_response(stream, "403 Forbidden", &symlink_form_html(&parent_path, Some("The parent folder requires its read+write PIN.")), &[], false);
+            return write_html_response(
+                stream,
+                "403 Forbidden",
+                &symlink_form_html(
+                    &parent_path,
+                    Some("The parent folder requires its read+write PIN."),
+                ),
+                &[],
+                false,
+            );
         }
     }
 
     let requested_target = match path_for_request(&config.root, &target_path) {
         Some(path) => path,
         None => {
-            return write_html_response(stream, "400 Bad Request", &symlink_form_html(&parent_path, Some("Invalid target path.")), &[], false);
+            return write_html_response(
+                stream,
+                "400 Bad Request",
+                &symlink_form_html(&parent_path, Some("Invalid target path.")),
+                &[],
+                false,
+            );
         }
     };
 
     let resolved_target = match contained_path(&config.root, &requested_target) {
         Ok(path) => path,
         Err(error) => {
-            let message = if error.kind() == io::ErrorKind::PermissionDenied { "Target symlink resolves outside the served directory." } else { "Target path does not exist." };
-            return write_html_response(stream, "400 Bad Request", &symlink_form_html(&parent_path, Some(message)), &[], false);
+            let message = if error.kind() == io::ErrorKind::PermissionDenied {
+                "Target symlink resolves outside the served directory."
+            } else {
+                "Target path does not exist."
+            };
+            return write_html_response(
+                stream,
+                "400 Bad Request",
+                &symlink_form_html(&parent_path, Some(message)),
+                &[],
+                false,
+            );
         }
     };
 
     let target_metadata = fs::metadata(&resolved_target)?;
-    if let Some((_share_dir, share)) = find_applicable_share(&config.root, &resolved_target, &target_metadata)? {
+    if let Some((_share_dir, share)) =
+        find_applicable_share(&config.root, &resolved_target, &target_metadata)?
+    {
         if !share.allows_read(target_pin.as_deref()) {
-            return write_html_response(stream, "403 Forbidden", &symlink_form_html(&parent_path, Some("The target file/folder requires its read or read+write PIN.")), &[], false);
+            return write_html_response(
+                stream,
+                "403 Forbidden",
+                &symlink_form_html(
+                    &parent_path,
+                    Some("The target file/folder requires its read or read+write PIN."),
+                ),
+                &[],
+                false,
+            );
         }
     }
 
     let link_path = parent.join(&link_name);
     if link_path.exists() || fs::symlink_metadata(&link_path).is_ok() {
-        return write_html_response(stream, "409 Conflict", &symlink_form_html(&parent_path, Some("A file, folder, or symlink with that name already exists.")), &[], false);
+        return write_html_response(
+            stream,
+            "409 Conflict",
+            &symlink_form_html(
+                &parent_path,
+                Some("A file, folder, or symlink with that name already exists."),
+            ),
+            &[],
+            false,
+        );
     }
 
     #[cfg(unix)]
@@ -2279,7 +2379,13 @@ fn handle_symlink_route(
             return write_html_response(
                 stream,
                 "500 Internal Server Error",
-                &symlink_form_html(&parent_path, Some(&format!("Could not create symlink. {}", write_permission_message(&parent_path, &error)))),
+                &symlink_form_html(
+                    &parent_path,
+                    Some(&format!(
+                        "Could not create symlink. {}",
+                        write_permission_message(&parent_path, &error)
+                    )),
+                ),
                 &[],
                 false,
             );
@@ -2288,12 +2394,27 @@ fn handle_symlink_route(
 
     #[cfg(not(unix))]
     {
-        return write_html_response(stream, "500 Internal Server Error", &symlink_form_html(&parent_path, Some("Creating symlinks from the browser is currently supported only on Unix/Linux.")), &[], false);
+        return write_html_response(
+            stream,
+            "500 Internal Server Error",
+            &symlink_form_html(
+                &parent_path,
+                Some(
+                    "Creating symlinks from the browser is currently supported only on Unix/Linux.",
+                ),
+            ),
+            &[],
+            false,
+        );
     }
 
-    write_redirect_with_cookie(stream, &parent_path, PIN_COOKIE, parent_pin.as_deref().unwrap_or(""))
+    write_redirect_with_cookie(
+        stream,
+        &parent_path,
+        PIN_COOKIE,
+        parent_pin.as_deref().unwrap_or(""),
+    )
 }
-
 
 fn handle_remote_route(
     stream: &mut TcpStream,
@@ -2319,8 +2440,14 @@ fn handle_remote_route(
 
     let form = String::from_utf8_lossy(&request.body);
     let parent_path = form_value(&form, "path").unwrap_or_else(|| "/".to_string());
-    let name = form_value(&form, "name").unwrap_or_default().trim().to_string();
-    let url = form_value(&form, "url").unwrap_or_default().trim().to_string();
+    let name = form_value(&form, "name")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let url = form_value(&form, "url")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     let remote_path = form_value(&form, "remote_path")
         .unwrap_or_else(|| "/".to_string())
         .trim()
@@ -2333,7 +2460,10 @@ fn handle_remote_route(
         return write_html_response(
             stream,
             "400 Bad Request",
-            &remote_form_html(&parent_path, Some("Name, remote URL, and remote path are required.")),
+            &remote_form_html(
+                &parent_path,
+                Some("Name, remote URL, and remote path are required."),
+            ),
             &[],
             false,
         );
@@ -2343,7 +2473,10 @@ fn handle_remote_route(
         return write_html_response(
             stream,
             "400 Bad Request",
-            &remote_form_html(&parent_path, Some("Link name cannot contain path separators or internal Splinterparty names.")),
+            &remote_form_html(
+                &parent_path,
+                Some("Link name cannot contain path separators or internal Splinterparty names."),
+            ),
             &[],
             false,
         );
@@ -2353,7 +2486,10 @@ fn handle_remote_route(
         return write_html_response(
             stream,
             "400 Bad Request",
-            &remote_form_html(&parent_path, Some("Remote URL must start with http:// or https://.")),
+            &remote_form_html(
+                &parent_path,
+                Some("Remote URL must start with http:// or https://."),
+            ),
             &[],
             false,
         );
@@ -2363,7 +2499,10 @@ fn handle_remote_route(
         return write_html_response(
             stream,
             "400 Bad Request",
-            &remote_form_html(&parent_path, Some("Remote path must start with / and cannot contain '..'.")),
+            &remote_form_html(
+                &parent_path,
+                Some("Remote path must start with / and cannot contain '..'."),
+            ),
             &[],
             false,
         );
@@ -2386,12 +2525,17 @@ fn handle_remote_route(
     };
 
     let parent_metadata = fs::metadata(&parent)?;
-    if let Some((_share_dir, share)) = find_applicable_share(&config.root, &parent, &parent_metadata)? {
+    if let Some((_share_dir, share)) =
+        find_applicable_share(&config.root, &parent, &parent_metadata)?
+    {
         if !share.allows_write(parent_pin.as_deref()) {
             return write_html_response(
                 stream,
                 "403 Forbidden",
-                &remote_form_html(&parent_path, Some("The parent folder requires its read+write PIN.")),
+                &remote_form_html(
+                    &parent_path,
+                    Some("The parent folder requires its read+write PIN."),
+                ),
                 &[],
                 false,
             );
@@ -2404,7 +2548,10 @@ fn handle_remote_route(
         return write_html_response(
             stream,
             "409 Conflict",
-            &remote_form_html(&parent_path, Some("A remote link with that name already exists.")),
+            &remote_form_html(
+                &parent_path,
+                Some("A remote link with that name already exists."),
+            ),
             &[],
             false,
         );
@@ -2432,7 +2579,12 @@ fn handle_remote_route(
         );
     }
 
-    write_redirect_with_cookie(stream, &parent_path, PIN_COOKIE, parent_pin.as_deref().unwrap_or(""))
+    write_redirect_with_cookie(
+        stream,
+        &parent_path,
+        PIN_COOKIE,
+        parent_pin.as_deref().unwrap_or(""),
+    )
 }
 
 fn handle_upload_route(
@@ -2530,7 +2682,6 @@ fn handle_upload_route(
     write_redirect_with_cookie(stream, &path, PIN_COOKIE, pin.as_deref().unwrap_or(""))
 }
 
-
 fn handle_delete_route(
     stream: &mut TcpStream,
     config: &Config,
@@ -2542,7 +2693,9 @@ fn handle_delete_route(
             .unwrap_or_else(|| "/".to_string());
         let require_pin = match delete_target(&config.root, &url_path) {
             Ok((path, metadata)) => {
-                if let Some((_share_dir, share)) = find_applicable_share(&config.root, &path, &metadata)? {
+                if let Some((_share_dir, share)) =
+                    find_applicable_share(&config.root, &path, &metadata)?
+                {
                     !share.allows_write(request_pin(request).as_deref())
                 } else {
                     false
@@ -2582,7 +2735,9 @@ fn handle_delete_route(
             let (status, message) = match error.kind() {
                 io::ErrorKind::InvalidInput => ("400 Bad Request", "Bad request path."),
                 io::ErrorKind::NotFound => ("404 Not Found", "File not found."),
-                io::ErrorKind::PermissionDenied => ("403 Forbidden", "Path escapes served directory."),
+                io::ErrorKind::PermissionDenied => {
+                    ("403 Forbidden", "Path escapes served directory.")
+                }
                 _ => return Err(error),
             };
             return write_html_response(
@@ -2610,7 +2765,10 @@ fn handle_delete_route(
         );
     }
 
-    if path.file_name().is_some_and(|name| name == SHARE_FILE || name == UPLOAD_FILE) {
+    if path
+        .file_name()
+        .is_some_and(|name| name == SHARE_FILE || name == UPLOAD_FILE)
+    {
         return write_html_response(
             stream,
             "403 Forbidden",
@@ -2624,20 +2782,25 @@ fn handle_delete_route(
         );
     }
 
-    let require_pin = if let Some((_share_dir, share)) = find_applicable_share(&config.root, &path, &metadata)? {
-        if !share.allows_write(Some(&pin)) {
-            return write_html_response(
-                stream,
-                "403 Forbidden",
-                &delete_form_html(&url_path, Some("Read+write PIN required or incorrect."), true),
-                &[],
-                false,
-            );
-        }
-        true
-    } else {
-        false
-    };
+    let require_pin =
+        if let Some((_share_dir, share)) = find_applicable_share(&config.root, &path, &metadata)? {
+            if !share.allows_write(Some(&pin)) {
+                return write_html_response(
+                    stream,
+                    "403 Forbidden",
+                    &delete_form_html(
+                        &url_path,
+                        Some("Read+write PIN required or incorrect."),
+                        true,
+                    ),
+                    &[],
+                    false,
+                );
+            }
+            true
+        } else {
+            false
+        };
 
     if let Err(error) = fs::remove_file(&path) {
         return write_html_response(
@@ -2664,9 +2827,8 @@ fn handle_delete_route(
 }
 
 fn delete_target(root: &Path, url_path: &str) -> io::Result<(PathBuf, fs::Metadata)> {
-    let requested_path = path_for_request(root, url_path).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "bad request path")
-    })?;
+    let requested_path = path_for_request(root, url_path)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad request path"))?;
 
     let file_name = requested_path
         .file_name()
@@ -2920,7 +3082,8 @@ fn handle_chunk_route(
         }
 
         let assembled_hash = hash_file(&temp_output)?;
-        let final_target = match unique_upload_target(&folder, &chunk_req.filename, &assembled_hash) {
+        let final_target = match unique_upload_target(&folder, &chunk_req.filename, &assembled_hash)
+        {
             Ok(target) => target,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let _ = fs::remove_file(&temp_output);
@@ -3184,7 +3347,9 @@ fn pin_prompt_html(path: &str, invalid: bool) -> String {
     if invalid {
         body.push_str("<p class=\"error\">PIN required or incorrect.</p>");
     }
-    body.push_str("<form method=\"post\" action=\"/__pin\"><input type=\"hidden\" name=\"path\" value=\"");
+    body.push_str(
+        "<form method=\"post\" action=\"/__pin\"><input type=\"hidden\" name=\"path\" value=\"",
+    );
     body.push_str(&escape_html(path));
     body.push_str("\"><label>Access level<select name=\"access\"><option value=\"guest\">Guest / read-only</option><option value=\"elevated\">Elevated / read+write</option></select></label><label>PIN<input name=\"pin\" type=\"password\" autofocus required></label><button type=\"submit\">Open folder</button></form></section></main></body></html>");
     body
@@ -3237,8 +3402,6 @@ fn folder_form_html(path: &str, error: Option<&str>) -> String {
     body
 }
 
-
-
 fn symlink_form_html(path: &str, error: Option<&str>) -> String {
     let mut body = String::new();
     body.push_str(r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>New symlink</title><style>"#);
@@ -3252,14 +3415,15 @@ fn symlink_form_html(path: &str, error: Option<&str>) -> String {
         body.push_str(&escape_html(error));
         body.push_str("</p>");
     }
-    body.push_str(r#"<form method="post" action="/__symlink"><input type="hidden" name="path" value=""#);
+    body.push_str(
+        r#"<form method="post" action="/__symlink"><input type="hidden" name="path" value=""#,
+    );
     body.push_str(&escape_html(path));
     body.push_str(r#""><label>Symlink name <span>shown in this folder</span><input name="name" required placeholder="doc1.pdf"></label><label>Target path <span>existing file/folder on this Splinterparty instance, example: /family/shared.pdf</span><input name="target_path" required placeholder="/family/shared.pdf"></label><label>Parent read+write PIN <span>required when creating inside a protected folder</span><input name="parent_pin" type="password"></label><label>Target read PIN <span>required if the target is inside a protected folder</span><input name="target_pin" type="password"></label><button type="submit">Create symlink</button></form><p class="muted">A symlink points to an existing file or folder on this same server, so the file is not stored twice. Symlinks are only allowed when their resolved target stays inside the served Splinterparty root.</p><p><a class="up" href=""#);
     body.push_str(&escape_html(path));
     body.push_str(r#"">Cancel</a></p></section></main></body></html>"#);
     body
 }
-
 
 fn remote_form_html(path: &str, error: Option<&str>) -> String {
     let mut body = String::new();
@@ -3274,14 +3438,15 @@ fn remote_form_html(path: &str, error: Option<&str>) -> String {
         body.push_str(&escape_html(error));
         body.push_str("</p>");
     }
-    body.push_str("<form method=\"post\" action=\"/__remote\"><input type=\"hidden\" name=\"path\" value=\"");
+    body.push_str(
+        "<form method=\"post\" action=\"/__remote\"><input type=\"hidden\" name=\"path\" value=\"",
+    );
     body.push_str(&escape_html(path));
     body.push_str("\"><label>Link name <span>shown in this folder</span><input name=\"name\" required placeholder=\"Work Drive\"></label><label>Remote Splinterparty URL <span>example: http://frankie:8080</span><input name=\"url\" required placeholder=\"http://frankie:8080\"></label><label>Remote path <span>example: /mira/doc1 or /general</span><input name=\"remote_path\" required value=\"/\"></label><label>Parent read+write PIN <span>required when creating inside a protected folder</span><input name=\"parent_pin\" type=\"password\"></label><button type=\"submit\">Create remote link</button></form><p class=\"muted\">Remote links are virtual symlinks between Splinterparty instances. The remote instance resolves its own local symlinks before serving files.</p><p><a class=\"up\" href=\"");
     body.push_str(&escape_html(path));
     body.push_str("\">Cancel</a></p></section></main></body></html>");
     body
 }
-
 
 fn delete_form_html(path: &str, error: Option<&str>, require_pin: bool) -> String {
     let mut body = String::new();
@@ -3296,13 +3461,17 @@ fn delete_form_html(path: &str, error: Option<&str>, require_pin: bool) -> Strin
         body.push_str(&escape_html(error));
         body.push_str("</p>");
     }
-    body.push_str("<form method=\"post\" action=\"/__delete\"><input type=\"hidden\" name=\"path\" value=\"");
+    body.push_str(
+        "<form method=\"post\" action=\"/__delete\"><input type=\"hidden\" name=\"path\" value=\"",
+    );
     body.push_str(&escape_html(path));
     body.push_str("\">");
     if require_pin {
         body.push_str("<label>Read+write PIN<input name=\"pin\" type=\"password\" autofocus required></label>");
     } else {
-        body.push_str("<p class=\"muted\">This file is outside a protected share, so no PIN is required.</p>");
+        body.push_str(
+            "<p class=\"muted\">This file is outside a protected share, so no PIN is required.</p>",
+        );
     }
     body.push_str("<button type=\"submit\">Delete file</button></form><p class=\"muted\">This permanently removes the file from the server directory.</p><p><a class=\"up\" href=\"");
     let parent = path
@@ -3345,10 +3514,7 @@ fn numbered_filename(filename: &str, index: u32) -> String {
     }
 
     let path = Path::new(filename);
-    let stem = path
-        .file_stem()
-        .and_then(OsStr::to_str)
-        .unwrap_or(filename);
+    let stem = path.file_stem().and_then(OsStr::to_str).unwrap_or(filename);
     let extension = path.extension().and_then(OsStr::to_str);
 
     match extension {
@@ -3409,7 +3575,6 @@ fn folder_operation_error_html(path: &str, error: &str) -> String {
     body.push_str("\">Back</a></p></section></main></body></html>");
     body
 }
-
 
 #[derive(Debug, Clone)]
 struct RemoteLink {
@@ -3498,7 +3663,6 @@ fn is_safe_symlink_name(name: &str) -> bool {
         && !name.ends_with(REMOTE_LINK_SUFFIX)
         && !name.ends_with(".upload-parts")
 }
-
 
 fn form_value(input: &str, name: &str) -> Option<String> {
     input.split('&').find_map(|pair| {
@@ -3603,7 +3767,10 @@ fn serve_directory(
             let entry = entry.ok()?;
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str == SHARE_FILE || name_str == UPLOAD_FILE || name_str.ends_with(".upload-parts") {
+            if name_str == SHARE_FILE
+                || name_str == UPLOAD_FILE
+                || name_str.ends_with(".upload-parts")
+            {
                 None
             } else {
                 Some(Ok(entry))
@@ -3641,7 +3808,9 @@ fn serve_directory(
     body.push_str("</span><small>items</small></div></header>");
 
     if let Some(remote_url) = tailscale_remote_url(bind_port) {
-        body.push_str("<section class=\"remote-card\"><strong>Tailscale remote access</strong><code>");
+        body.push_str(
+            "<section class=\"remote-card\"><strong>Tailscale remote access</strong><code>",
+        );
         body.push_str(&escape_html(&remote_url));
         body.push_str("</code><small>Open this URL from another device connected to the same Tailscale network.</small></section>");
     }
@@ -3739,7 +3908,13 @@ fn serve_directory(
         body.push_str("\"><a class=\"name\" href=\"");
         body.push_str(&href);
         body.push_str("\"><span class=\"icon\">");
-        body.push_str(if is_symlink { "LINK" } else if is_dir { "DIR" } else { "FILE" });
+        body.push_str(if is_symlink {
+            "LINK"
+        } else if is_dir {
+            "DIR"
+        } else {
+            "FILE"
+        });
         body.push_str("</span><span>");
         body.push_str(&escape_html(&display_name));
         body.push_str(suffix);
@@ -3849,7 +4024,14 @@ fn serve_directory(
     body.push_str("})();");
     body.push_str("</script>");
 
-    body.push_str(r#"<div id="context-menu" class="context-menu"><a id="ctx-open" href="#">Open</a><a id="ctx-download" href="#" download>Download</a><button id="ctx-symlink" type="button">Create symlink here…</button><a id="ctx-delete" class="danger" href="#">Delete…</a></div>"#);
+    body.push_str(
+        r##"<div id="context-menu" class="context-menu">
+    <a id="ctx-open" href="#">Open</a>
+    <a id="ctx-download" href="#" download>Download</a>
+    <button id="ctx-symlink" type="button">Create symlink here…</button>
+    <a id="ctx-delete" class="danger" href="#">Delete…</a>
+    </div>"##,
+    );
     body.push_str("<script>");
     body.push_str("(function(){const menu=document.getElementById('context-menu');if(!menu)return;let current=null;const open=document.getElementById('ctx-open');const down=document.getElementById('ctx-download');const del=document.getElementById('ctx-delete');const sym=document.getElementById('ctx-symlink');function hide(){menu.style.display='none';}document.addEventListener('click',hide);document.addEventListener('keydown',e=>{if(e.key==='Escape')hide();});document.querySelectorAll('.row.item').forEach(row=>{row.addEventListener('contextmenu',e=>{e.preventDefault();current=row;const path=row.dataset.path;open.href=path;down.href=path;down.style.display=row.dataset.download==='1'?'block':'none';del.href='/__delete?path='+encodeURIComponent(path);menu.style.left=Math.min(e.clientX,window.innerWidth-210)+'px';menu.style.top=Math.min(e.clientY,window.innerHeight-170)+'px';menu.style.display='block';});});sym.addEventListener('click',()=>{if(!current)return;hide();const target=current.dataset.path;const defaultName=current.dataset.name||'link';const dest=prompt('Create symlink in which folder?', '");
     body.push_str(&folder_url_path);
