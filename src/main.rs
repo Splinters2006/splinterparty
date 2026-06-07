@@ -41,6 +41,8 @@ a:hover { text-decoration: underline; }
 .row { display: grid; grid-template-columns: minmax(220px, 1fr) 120px 110px 160px; gap: 14px; align-items: center; min-height: 52px; padding: 0 16px; border-top: 1px solid #edf0f4; }
 .row:first-child { border-top: 0; }
 .row.head { min-height: 38px; background: #f1f4f8; color: #53606f; font-size: 12px; font-weight: 750; text-transform: uppercase; }
+.name-cell { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.select-box { flex: 0 0 auto; width: 16px; height: 16px; margin: 0; accent-color: #155eef; cursor: pointer; }
 .name { display: inline-flex; align-items: center; gap: 10px; min-width: 0; color: #111827; font-weight: 650; overflow-wrap: anywhere; }
 .icon { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 42px; height: 24px; border-radius: 6px; background: #e7eefc; color: #174ea6; font-size: 10px; font-weight: 800; }
 .type { color: #53606f; }
