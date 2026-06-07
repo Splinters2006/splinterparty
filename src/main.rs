@@ -2197,18 +2197,23 @@ fn handle_symlink_route(
     config: &Config,
     request: &Request,
 ) -> io::Result<()> {
+    let session_pin = request_pin(request);
+
     if request.method == "GET" {
         let path = request
             .query_value("path")
             .unwrap_or_else(|| "/".to_string());
         let target_path = request.query_value("target_path").unwrap_or_default();
         let name = request.query_value("name").unwrap_or_default();
-        return write_html_response(
+        return write_symlink_form_response(
             stream,
             "200 OK",
-            &symlink_form_html_with_values(&path, None, &target_path, &name),
-            &[],
-            false,
+            config,
+            session_pin.as_deref(),
+            &path,
+            None,
+            &target_path,
+            &name,
         );
     }
 
@@ -2232,59 +2237,64 @@ fn handle_symlink_route(
         .unwrap_or_default()
         .trim()
         .to_string();
-    let parent_pin = request_pin(request);
+    let parent_pin = form_value(&form, "parent_pin")
+        .filter(|pin| !pin.is_empty())
+        .or_else(|| session_pin.clone());
     let target_pin = form_value(&form, "target_pin")
         .filter(|pin| !pin.is_empty())
-        .or_else(|| request_pin(request));
+        .or_else(|| session_pin.clone());
 
     if link_name.is_empty() || target_path.is_empty() {
-        return write_html_response(
+        return write_symlink_form_response(
             stream,
             "400 Bad Request",
-            &symlink_form_html(
-                &parent_path,
-                Some("Link name and target path are required."),
-            ),
-            &[],
-            false,
+            config,
+            session_pin.as_deref(),
+            &parent_path,
+            Some("Link name and target path are required."),
+            &target_path,
+            &link_name,
         );
     }
 
     if !is_safe_symlink_name(&link_name) {
-        return write_html_response(
+        return write_symlink_form_response(
             stream,
             "400 Bad Request",
-            &symlink_form_html(
-                &parent_path,
-                Some("Link name cannot contain path separators or internal Splinterparty names."),
-            ),
-            &[],
-            false,
+            config,
+            session_pin.as_deref(),
+            &parent_path,
+            Some("Link name cannot contain path separators or internal Splinterparty names."),
+            &target_path,
+            &link_name,
         );
     }
 
     if !target_path.starts_with('/') {
-        return write_html_response(
+        return write_symlink_form_response(
             stream,
             "400 Bad Request",
-            &symlink_form_html(&parent_path, Some("Target path must start with /.")),
-            &[],
-            false,
+            config,
+            session_pin.as_deref(),
+            &parent_path,
+            Some("Target path must start with /."),
+            &target_path,
+            &link_name,
         );
     }
 
     let parent = match folder_from_url_path(&config.root, &parent_path) {
         Ok(parent) => parent,
         Err(error) => {
-            return write_html_response(
+            return write_symlink_form_response(
                 stream,
                 "400 Bad Request",
-                &symlink_form_html(
-                    &parent_path,
-                    Some(&format!("Could not open parent folder: {error}.")),
-                ),
-                &[],
-                false,
+                config,
+                session_pin.as_deref(),
+                &parent_path,
+                Some(&format!("Could not open parent folder: {error}.")),
+                &target_path,
+                &link_name,
             );
         }
     };
@@ -2294,15 +2304,15 @@ fn handle_symlink_route(
         find_applicable_share(&config.root, &parent, &parent_metadata)?
     {
         if !share.allows_write(parent_pin.as_deref()) {
-            return write_html_response(
+            return write_symlink_form_response(
                 stream,
                 "403 Forbidden",
-                &symlink_form_html(
-                    &parent_path,
-                    Some("The parent folder requires its read+write PIN."),
-                ),
-                &[],
-                false,
+                config,
+                session_pin.as_deref(),
+                &parent_path,
+                Some("The destination folder requires its read+write PIN."),
+                &target_path,
+                &link_name,
             );
         }
     }
@@ -2310,12 +2320,15 @@ fn handle_symlink_route(
     let requested_target = match path_for_request(&config.root, &target_path) {
         Some(path) => path,
         None => {
-            return write_html_response(
+            return write_symlink_form_response(
                 stream,
                 "400 Bad Request",
-                &symlink_form_html(&parent_path, Some("Invalid target path.")),
-                &[],
-                false,
+                config,
+                session_pin.as_deref(),
+                &parent_path,
+                Some("Invalid target path."),
+                &target_path,
+                &link_name,
             );
         }
     };
@@ -2328,12 +2341,15 @@ fn handle_symlink_route(
             } else {
                 "Target path does not exist."
             };
-            return write_html_response(
+            return write_symlink_form_response(
                 stream,
                 "400 Bad Request",
-                &symlink_form_html(&parent_path, Some(message)),
-                &[],
-                false,
+                config,
+                session_pin.as_deref(),
+                &parent_path,
+                Some(message),
+                &target_path,
+                &link_name,
             );
         }
     };
@@ -2343,65 +2359,63 @@ fn handle_symlink_route(
         find_applicable_share(&config.root, &resolved_target, &target_metadata)?
     {
         if !share.allows_read(target_pin.as_deref()) {
-            return write_html_response(
+            return write_symlink_form_response(
                 stream,
                 "403 Forbidden",
-                &symlink_form_html(
-                    &parent_path,
-                    Some("The target file/folder requires its read or read+write PIN."),
-                ),
-                &[],
-                false,
+                config,
+                session_pin.as_deref(),
+                &parent_path,
+                Some("The target file/folder requires its read or read+write PIN."),
+                &target_path,
+                &link_name,
             );
         }
     }
 
     let link_path = parent.join(&link_name);
     if link_path.exists() || fs::symlink_metadata(&link_path).is_ok() {
-        return write_html_response(
+        return write_symlink_form_response(
             stream,
             "409 Conflict",
-            &symlink_form_html(
-                &parent_path,
-                Some("A file, folder, or symlink with that name already exists."),
-            ),
-            &[],
-            false,
+            config,
+            session_pin.as_deref(),
+            &parent_path,
+            Some("A file, folder, or symlink with that name already exists."),
+            &target_path,
+            &link_name,
         );
     }
 
     #[cfg(unix)]
     {
         if let Err(error) = std::os::unix::fs::symlink(&resolved_target, &link_path) {
-            return write_html_response(
+            return write_symlink_form_response(
                 stream,
                 "500 Internal Server Error",
-                &symlink_form_html(
-                    &parent_path,
-                    Some(&format!(
-                        "Could not create symlink. {}",
-                        write_permission_message(&parent_path, &error)
-                    )),
-                ),
-                &[],
-                false,
+                config,
+                session_pin.as_deref(),
+                &parent_path,
+                Some(&format!(
+                    "Could not create symlink. {}",
+                    write_permission_message(&parent_path, &error)
+                )),
+                &target_path,
+                &link_name,
             );
         }
     }
 
     #[cfg(not(unix))]
     {
-        return write_html_response(
+        return write_symlink_form_response(
             stream,
             "500 Internal Server Error",
-            &symlink_form_html(
-                &parent_path,
-                Some(
-                    "Creating symlinks from the browser is currently supported only on Unix/Linux.",
-                ),
-            ),
-            &[],
-            false,
+            config,
+            session_pin.as_deref(),
+            &parent_path,
+            Some("Creating symlinks from the browser is currently supported only on Unix/Linux."),
+            &target_path,
+            &link_name,
         );
     }
 
@@ -3399,16 +3413,29 @@ fn folder_form_html(path: &str, error: Option<&str>) -> String {
     body
 }
 
-fn symlink_form_html(path: &str, error: Option<&str>) -> String {
-    symlink_form_html_with_values(path, error, "", "")
-}
-
-fn symlink_form_html_with_values(
+fn write_symlink_form_response(
+    stream: &mut TcpStream,
+    status: &str,
+    config: &Config,
+    pin: Option<&str>,
     path: &str,
     error: Option<&str>,
     target_path: &str,
     name: &str,
-) -> String {
+) -> io::Result<()> {
+    let body = symlink_form_html_with_values(config, pin, path, error, target_path, name)?;
+    write_html_response(stream, status, &body, &[], false)
+}
+
+fn symlink_form_html_with_values(
+    config: &Config,
+    pin: Option<&str>,
+    path: &str,
+    error: Option<&str>,
+    target_path: &str,
+    name: &str,
+) -> io::Result<String> {
+    let folders = accessible_folder_paths(&config.root, pin)?;
     let mut body = String::new();
     body.push_str(r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>New symlink</title><style>"#);
     body.push_str(DIRECTORY_CSS);
@@ -3421,18 +3448,27 @@ fn symlink_form_html_with_values(
         body.push_str(&escape_html(error));
         body.push_str("</p>");
     }
-    body.push_str(
-        r#"<form method="post" action="/__symlink"><input type="hidden" name="path" value=""#,
-    );
-    body.push_str(&escape_html(path));
-    body.push_str(r#""><label>Symlink name <span>shown in this folder</span><input name="name" required placeholder="doc1.pdf" value=""#);
+    body.push_str(r#"<form method="post" action="/__symlink"><label>Destination folder <span>folders readable with your current access</span><select name="path" required>"#);
+    for folder in folders {
+        let folder_path = url_path_for(&config.root, &folder);
+        body.push_str(r#"<option value=""#);
+        body.push_str(&escape_html(&folder_path));
+        body.push('"');
+        if folder_path == path {
+            body.push_str(" selected");
+        }
+        body.push('>');
+        body.push_str(&escape_html(&folder_path));
+        body.push_str("</option>");
+    }
+    body.push_str(r#"</select></label><label>Symlink name <span>shown in the destination folder</span><input name="name" required placeholder="doc1.pdf" value=""#);
     body.push_str(&escape_html(name));
     body.push_str(r#""></label><label>Target path <span>existing file/folder on this Splinterparty instance, example: /family/shared.pdf</span><input name="target_path" required placeholder="/family/shared.pdf" value=""#);
     body.push_str(&escape_html(target_path));
-    body.push_str(r#""></label><label>Target read PIN <span>required if the target is inside a protected folder</span><input name="target_pin" type="password"></label><button type="submit">Create symlink</button></form><p class="muted">A symlink points to an existing file or folder on this same server, so the file is not stored twice. Symlinks are only allowed when their resolved target stays inside the served Splinterparty root.</p><p><a class="up" href=""#);
+    body.push_str(r#""></label><label>Destination read+write PIN <span>required if the destination folder is protected</span><input name="parent_pin" type="password"></label><label>Target read PIN <span>required if the target is inside a protected folder</span><input name="target_pin" type="password"></label><button type="submit">Create symlink</button></form><p class="muted">A symlink points to an existing file or folder on this same server, so the file is not stored twice. Symlinks are only allowed when their resolved target stays inside the served Splinterparty root.</p><p><a class="up" href=""#);
     body.push_str(&escape_html(path));
     body.push_str(r#"">Cancel</a></p></section></main></body></html>"#);
-    body
+    Ok(body)
 }
 
 fn remote_form_html(path: &str, error: Option<&str>) -> String {
@@ -3732,6 +3768,52 @@ fn contained_path(root: &Path, requested_path: &Path) -> io::Result<PathBuf> {
     }
 }
 
+fn accessible_folder_paths(root: &Path, pin: Option<&str>) -> io::Result<Vec<PathBuf>> {
+    let mut folders = Vec::new();
+    collect_accessible_folders(root, root, pin, &mut folders)?;
+    folders.sort_by_key(|folder| url_path_for(root, folder));
+    Ok(folders)
+}
+
+fn collect_accessible_folders(
+    root: &Path,
+    folder: &Path,
+    pin: Option<&str>,
+    folders: &mut Vec<PathBuf>,
+) -> io::Result<()> {
+    let symlink_metadata = fs::symlink_metadata(folder)?;
+    if symlink_metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+
+    let metadata = fs::metadata(folder)?;
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+
+    if let Some((_share_dir, share)) = find_applicable_share(root, folder, &metadata)? {
+        if !share.allows_read(pin) {
+            return Ok(());
+        }
+    }
+
+    folders.push(folder.to_path_buf());
+
+    for entry in fs::read_dir(folder)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str == SHARE_FILE || name_str == UPLOAD_FILE || name_str.ends_with(".upload-parts")
+        {
+            continue;
+        }
+
+        collect_accessible_folders(root, &entry.path(), pin, folders)?;
+    }
+
+    Ok(())
+}
+
 fn percent_decode(value: &str) -> Option<String> {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
@@ -3855,7 +3937,16 @@ fn serve_directory(
                     body.push_str(&escape_html(&link.name));
                     body.push_str(r#"" data-path=""#);
                     body.push_str(&escape_html(&href));
-                    body.push_str(r#"" data-is-dir="0" data-download="1"><a class="name" href=""#);
+                    body.push_str(r#"" data-delete-path=""#);
+                    let delete_path = format!(
+                        "{}/{}",
+                        url_path_for(root, path).trim_end_matches('/'),
+                        url_encode_path_segment(&name)
+                    );
+                    body.push_str(&escape_html(&delete_path));
+                    body.push_str(
+                        r#"" data-is-dir="0" data-download="1" data-delete="1" data-can-symlink="0"><a class="name" href=""#,
+                    );
                     body.push_str(&escape_html(&href));
                     body.push_str(r#""><span class="icon">NET</span><span>"#);
                     body.push_str(&escape_html(&link.name));
@@ -3901,9 +3992,15 @@ fn serve_directory(
         body.push_str(&escape_html(&display_name));
         body.push_str("\" data-path=\"");
         body.push_str(&escape_html(&item_url_path));
+        body.push_str("\" data-delete-path=\"");
+        body.push_str(&escape_html(&item_url_path));
         body.push_str("\" data-is-dir=\"");
         body.push_str(if is_dir { "1" } else { "0" });
         body.push_str("\" data-download=\"");
+        body.push_str(if !is_dir { "1" } else { "0" });
+        body.push_str("\" data-delete=\"");
+        body.push_str(if !is_dir || is_symlink { "1" } else { "0" });
+        body.push_str("\" data-can-symlink=\"");
         body.push_str(if !is_dir { "1" } else { "0" });
         body.push_str("\"><a class=\"name\" href=\"");
         body.push_str(&href);
@@ -4014,14 +4111,14 @@ fn serve_directory(
         r##"<div id="context-menu" class="context-menu">
     <a id="ctx-open" href="#">Open</a>
     <a id="ctx-download" href="#" download>Download</a>
-    <button id="ctx-symlink" type="button">Create symlink here…</button>
+    <button id="ctx-symlink" type="button">Symlink to this file…</button>
     <a id="ctx-delete" class="danger" href="#">Delete…</a>
     </div>"##,
     );
     body.push_str("<script>");
-    body.push_str("(function(){const menu=document.getElementById('context-menu');if(!menu)return;let current=null;const open=document.getElementById('ctx-open');const down=document.getElementById('ctx-download');const del=document.getElementById('ctx-delete');const sym=document.getElementById('ctx-symlink');function hide(){menu.style.display='none';}document.addEventListener('click',hide);document.addEventListener('keydown',e=>{if(e.key==='Escape')hide();});document.querySelectorAll('.row.item').forEach(row=>{row.addEventListener('contextmenu',e=>{e.preventDefault();current=row;const path=row.dataset.path;open.href=path;down.href=path;down.style.display=row.dataset.download==='1'?'block':'none';del.href='/__delete?path='+encodeURIComponent(path);menu.style.left=Math.min(e.clientX,window.innerWidth-210)+'px';menu.style.top=Math.min(e.clientY,window.innerHeight-170)+'px';menu.style.display='block';});});sym.addEventListener('click',()=>{if(!current)return;hide();const target=current.dataset.path;const defaultName=current.dataset.name||'link';const dest=prompt('Create symlink in which folder?', '");
+    body.push_str("(function(){const menu=document.getElementById('context-menu');if(!menu)return;let current=null;const open=document.getElementById('ctx-open');const down=document.getElementById('ctx-download');const del=document.getElementById('ctx-delete');const sym=document.getElementById('ctx-symlink');function hide(){menu.style.display='none';}document.addEventListener('click',hide);document.addEventListener('keydown',e=>{if(e.key==='Escape')hide();});document.querySelectorAll('.row.item').forEach(row=>{row.addEventListener('contextmenu',e=>{e.preventDefault();current=row;const path=row.dataset.path;open.href=path;down.href=path;down.style.display=row.dataset.download==='1'?'block':'none';del.href='/__delete?path='+encodeURIComponent(row.dataset.deletePath||path);del.style.display=row.dataset.delete==='1'?'block':'none';sym.style.display=row.dataset.canSymlink==='1'?'block':'none';menu.style.left=Math.min(e.clientX,window.innerWidth-210)+'px';menu.style.top=Math.min(e.clientY,window.innerHeight-190)+'px';menu.style.display='block';});});sym.addEventListener('click',()=>{if(!current)return;hide();const target=current.dataset.path;const defaultName=current.dataset.name||'link';const name=prompt('Symlink name:', defaultName);if(!name)return;const params=new URLSearchParams({path:'");
     body.push_str(&folder_url_path);
-    body.push_str("');if(dest===null)return;const name=prompt('Symlink name:', defaultName);if(!name)return;const params=new URLSearchParams({path:dest,target_path:target,name:name});window.location.href='/__symlink?'+params.toString();});})();");
+    body.push_str("',target_path:target,name:name});window.location.href='/__symlink?'+params.toString();});})();");
     body.push_str("</script>");
 
     body.push_str("</section></main></body></html>\n");
