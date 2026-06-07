@@ -52,6 +52,9 @@ a:hover { text-decoration: underline; }
 .context-menu button, .context-menu a { display: block; width: 100%; padding: 9px 10px; border: 0; border-radius: 7px; background: transparent; color: #111827; font: inherit; font-weight: 650; text-align: left; text-decoration: none; cursor: pointer; }
 .context-menu button:hover, .context-menu a:hover { background: #eef2ff; text-decoration: none; }
 .context-menu .danger { color: #991b1b; }
+.row.item[draggable="true"] { user-select: none; }
+.row.item.dragging { opacity: .55; }
+.row.item.drop-target { outline: 2px solid #155eef; outline-offset: -2px; background: #eef2ff; }
 .empty { padding: 28px 16px; color: #657386; }
 .upload-panel { margin-top: 18px; border: 1px solid #d9dee7; border-radius: 8px; background: #ffffff; padding: 16px; }
 .upload-panel h2 { margin: 0 0 12px; font-size: 18px; }
@@ -1456,6 +1459,11 @@ fn handle_connection(mut stream: TcpStream, config: &Config) -> io::Result<()> {
         return handle_delete_route(&mut stream, config, &request);
     }
 
+    if request.target.starts_with("/__move") {
+        log_request(&peer, &request, "200");
+        return handle_move_route(&mut stream, config, &request);
+    }
+
     if request.method != "GET" && request.method != "HEAD" {
         log_request(&peer, &request, "405");
         return write_text_response(
@@ -2858,6 +2866,148 @@ fn delete_target(root: &Path, url_path: &str) -> io::Result<(PathBuf, fs::Metada
     Ok((path, metadata))
 }
 
+fn handle_move_route(stream: &mut TcpStream, config: &Config, request: &Request) -> io::Result<()> {
+    if request.method != "POST" {
+        return write_text_response(
+            stream,
+            "405 Method Not Allowed",
+            "Method not allowed\n",
+            &[("Allow", "POST")],
+            false,
+        );
+    }
+
+    let form = String::from_utf8_lossy(&request.body);
+    let source_path = form_value(&form, "source").unwrap_or_default();
+    let destination_path = form_value(&form, "destination").unwrap_or_default();
+    let pin = form_value(&form, "pin")
+        .filter(|pin| !pin.is_empty())
+        .or_else(|| request_pin(request))
+        .unwrap_or_default();
+
+    let (source, source_metadata) = match move_source(&config.root, &source_path) {
+        Ok(source) => source,
+        Err(error) => {
+            return write_text_response(
+                stream,
+                move_error_status(&error),
+                &format!("Could not move source: {error}\n"),
+                &[],
+                false,
+            );
+        }
+    };
+
+    let destination = match folder_from_url_path(&config.root, &destination_path) {
+        Ok(destination) => destination,
+        Err(error) => {
+            return write_text_response(
+                stream,
+                move_error_status(&error),
+                &format!("Could not open destination folder: {error}\n"),
+                &[],
+                false,
+            );
+        }
+    };
+
+    let destination_metadata = fs::metadata(&destination)?;
+    if !share_allows_write(&config.root, &source, &source_metadata, Some(&pin))?
+        || !share_allows_write(
+            &config.root,
+            &destination,
+            &destination_metadata,
+            Some(&pin),
+        )?
+    {
+        return write_text_response(
+            stream,
+            "403 Forbidden",
+            "Read+write PIN required or incorrect.\n",
+            &[],
+            false,
+        );
+    }
+
+    let file_name = source
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad source path"))?;
+    let target = destination.join(file_name);
+
+    if source == target {
+        return write_text_response(stream, "204 No Content", "", &[], false);
+    }
+
+    if target.exists() || fs::symlink_metadata(&target).is_ok() {
+        return write_text_response(
+            stream,
+            "409 Conflict",
+            "A file or symlink with that name already exists in the destination.\n",
+            &[],
+            false,
+        );
+    }
+
+    if let Err(error) = fs::rename(&source, &target) {
+        return write_text_response(
+            stream,
+            "500 Internal Server Error",
+            &format!("Could not move item: {error}\n"),
+            &[],
+            false,
+        );
+    }
+
+    write_text_response(stream, "204 No Content", "", &[], false)
+}
+
+fn move_source(root: &Path, url_path: &str) -> io::Result<(PathBuf, fs::Metadata)> {
+    let (path, metadata) = delete_target(root, url_path)?;
+    let is_symlink = metadata.file_type().is_symlink();
+    if !metadata.is_file() && !is_symlink {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "only files and symlinks can be moved",
+        ));
+    }
+
+    if path
+        .file_name()
+        .is_some_and(|name| name == SHARE_FILE || name == UPLOAD_FILE)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "internal Splinterparty files cannot be moved",
+        ));
+    }
+
+    Ok((path, metadata))
+}
+
+fn share_allows_write(
+    root: &Path,
+    path: &Path,
+    metadata: &fs::Metadata,
+    pin: Option<&str>,
+) -> io::Result<bool> {
+    Ok(
+        if let Some((_share_dir, share)) = find_applicable_share(root, path, metadata)? {
+            share.allows_write(pin)
+        } else {
+            true
+        },
+    )
+}
+
+fn move_error_status(error: &io::Error) -> &'static str {
+    match error.kind() {
+        io::ErrorKind::InvalidInput => "400 Bad Request",
+        io::ErrorKind::NotFound => "404 Not Found",
+        io::ErrorKind::PermissionDenied => "403 Forbidden",
+        _ => "500 Internal Server Error",
+    }
+}
+
 // ── Chunked upload state ──────────────────────────────────────────────────────
 //
 // When the browser uploads a file larger than LARGE_FILE_PART_SIZE it sends
@@ -3855,23 +4005,21 @@ fn serve_directory(
     }
 
     body.push_str("<nav>");
-    if !relative.as_os_str().is_empty() {
-        body.push_str("<a class=\"up\" href=\"../\">Up one directory</a>");
-    }
     body.push_str("<a class=\"up\" href=\"/__share?path=");
     body.push_str(&url_encode_query_value(&url_path_for(root, path)));
-    body.push_str("\">Share settings</a>");
-    body.push_str("<a class=\"up\" href=\"/__folder?path=");
-    body.push_str(&url_encode_query_value(&url_path_for(root, path)));
-    body.push_str("\">New folder</a>");
-    body.push_str("<a class=\"up\" href=\"/__remote?path=");
-    body.push_str(&url_encode_query_value(&url_path_for(root, path)));
-    body.push_str("\">New remote link</a>");
-    body.push_str("<a class=\"up\" href=\"/__symlink?path=");
-    body.push_str(&url_encode_query_value(&url_path_for(root, path)));
-    body.push_str("\">New symlink</a></nav>");
+    body.push_str("\">Share settings</a></nav>");
 
     body.push_str("<section class=\"browser\"><div class=\"row head\"><span>Name</span><span>Type</span><span>Size</span><span>Modified</span></div>");
+
+    if !relative.as_os_str().is_empty() {
+        let parent_path = path.parent().unwrap_or(root);
+        let parent_url_path = url_path_for(root, parent_path);
+        body.push_str(r#"<div class="row item" data-name=".." data-path=""#);
+        body.push_str(&escape_html(&parent_url_path));
+        body.push_str(r#"" data-delete-path=""#);
+        body.push_str(&escape_html(&parent_url_path));
+        body.push_str(r#"" data-is-dir="1" data-download="0" data-delete="0" data-can-symlink="0" data-can-drag="0" data-drop-target="1"><a class="name" href="../"><span class="icon">DIR</span><span>..</span></a><span class="type">Parent folder</span><span>-</span><span>-</span></div>"#);
+    }
 
     for entry in entries {
         let name = entry.file_name();
@@ -3892,7 +4040,7 @@ fn serve_directory(
                     );
                     body.push_str(&escape_html(&delete_path));
                     body.push_str(
-                        r#"" data-is-dir="0" data-download="1" data-delete="1" data-can-symlink="0"><a class="name" href=""#,
+                        r#"" data-is-dir="0" data-download="1" data-delete="1" data-can-symlink="0" data-can-drag="0" data-drop-target="0"><a class="name" href=""#,
                     );
                     body.push_str(&escape_html(&href));
                     body.push_str(r#""><span class="icon">NET</span><span>"#);
@@ -3949,6 +4097,14 @@ fn serve_directory(
         body.push_str(if !is_dir || is_symlink { "1" } else { "0" });
         body.push_str("\" data-can-symlink=\"");
         body.push_str(if !is_dir { "1" } else { "0" });
+        body.push_str("\" data-can-drag=\"");
+        let can_drag = !is_dir || is_symlink;
+        body.push_str(if can_drag { "1" } else { "0" });
+        body.push_str("\" data-drop-target=\"");
+        body.push_str(if is_dir && !is_symlink { "1" } else { "0" });
+        if can_drag {
+            body.push_str("\" draggable=\"true");
+        }
         body.push_str("\"><a class=\"name\" href=\"");
         body.push_str(&href);
         body.push_str("\"><span class=\"icon\">");
@@ -4066,6 +4222,9 @@ fn serve_directory(
     body.push_str("(function(){const menu=document.getElementById('context-menu');if(!menu)return;let current=null;const open=document.getElementById('ctx-open');const down=document.getElementById('ctx-download');const del=document.getElementById('ctx-delete');const sym=document.getElementById('ctx-symlink');function hide(){menu.style.display='none';}document.addEventListener('click',hide);document.addEventListener('keydown',e=>{if(e.key==='Escape')hide();});document.querySelectorAll('.row.item').forEach(row=>{row.addEventListener('contextmenu',e=>{e.preventDefault();current=row;const path=row.dataset.path;open.href=path;down.href=path;down.style.display=row.dataset.download==='1'?'block':'none';del.href='/__delete?path='+encodeURIComponent(row.dataset.deletePath||path);del.style.display=row.dataset.delete==='1'?'block':'none';sym.style.display=row.dataset.canSymlink==='1'?'block':'none';menu.style.left=Math.min(e.clientX,window.innerWidth-210)+'px';menu.style.top=Math.min(e.clientY,window.innerHeight-190)+'px';menu.style.display='block';});});sym.addEventListener('click',()=>{if(!current)return;hide();const target=current.dataset.path;const defaultName=current.dataset.name||'link';const name=prompt('Symlink name:', defaultName);if(!name)return;const params=new URLSearchParams({path:'");
     body.push_str(&folder_url_path);
     body.push_str("',target_path:target,name:name});window.location.href='/__symlink?'+params.toString();});})();");
+    body.push_str("</script>");
+    body.push_str("<script>");
+    body.push_str("(function(){let dragged=null;async function moveItem(source,destination,pin){const body=new URLSearchParams({source:source,destination:destination});if(pin)body.set('pin',pin);return fetch('/__move',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});}async function dropMove(source,destination){let resp=await moveItem(source,destination,'');if(resp.status===403){const pin=prompt('Read+write PIN for the source and destination folders:');if(pin===null)return;resp=await moveItem(source,destination,pin);}if(resp.ok||resp.status===204){window.location.reload();return;}alert((await resp.text())||'Could not move item.');}document.querySelectorAll('.row.item').forEach(row=>{if(row.dataset.canDrag==='1'){row.addEventListener('dragstart',e=>{dragged=row;row.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',row.dataset.path);});row.addEventListener('dragend',()=>{row.classList.remove('dragging');dragged=null;document.querySelectorAll('.drop-target').forEach(el=>el.classList.remove('drop-target'));});}if(row.dataset.dropTarget==='1'){row.addEventListener('dragover',e=>{if(!dragged||dragged===row)return;e.preventDefault();e.dataTransfer.dropEffect='move';row.classList.add('drop-target');});row.addEventListener('dragleave',()=>row.classList.remove('drop-target'));row.addEventListener('drop',e=>{if(!dragged||dragged===row)return;e.preventDefault();row.classList.remove('drop-target');const source=dragged.dataset.path;const destination=row.dataset.path;dropMove(source,destination);});}});})();");
     body.push_str("</script>");
 
     body.push_str("</section></main></body></html>\n");
