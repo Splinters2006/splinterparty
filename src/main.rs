@@ -1406,6 +1406,11 @@ fn handle_connection(mut stream: TcpStream, config: &Config) -> io::Result<()> {
         return handle_chunk_route(&mut stream, config, &request);
     }
 
+    if request.target.starts_with("/__delete") {
+        log_request(&peer, &request, "200");
+        return handle_delete_route(&mut stream, config, &request);
+    }
+
     if request.method != "GET" && request.method != "HEAD" {
         log_request(&peer, &request, "405");
         return write_text_response(
@@ -2227,6 +2232,143 @@ fn handle_upload_route(
     write_redirect_with_cookie(stream, &path, PIN_COOKIE, pin.as_deref().unwrap_or(""))
 }
 
+fn handle_delete_route(
+    stream: &mut TcpStream,
+    config: &Config,
+    request: &Request,
+) -> io::Result<()> {
+    if request.method == "GET" {
+        let path = request
+            .query_value("path")
+            .unwrap_or_else(|| "/".to_string());
+        return write_html_response(stream, "200 OK", &delete_form_html(&path, None), &[], false);
+    }
+
+    if request.method != "POST" {
+        return write_text_response(
+            stream,
+            "405 Method Not Allowed",
+            "Method not allowed\n",
+            &[("Allow", "GET, POST")],
+            false,
+        );
+    }
+
+    let form = String::from_utf8_lossy(&request.body);
+    let url_path = form_value(&form, "path").unwrap_or_else(|| "/".to_string());
+    let pin = form_value(&form, "pin").unwrap_or_default();
+
+    let requested_path = match path_for_request(&config.root, &url_path) {
+        Some(path) => path,
+        None => {
+            return write_html_response(
+                stream,
+                "400 Bad Request",
+                &delete_form_html(&url_path, Some("Bad request path.")),
+                &[],
+                false,
+            );
+        }
+    };
+
+    let path = match contained_path(&config.root, &requested_path) {
+        Ok(path) => path,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return write_html_response(
+                stream,
+                "404 Not Found",
+                &delete_form_html(&url_path, Some("File not found.")),
+                &[],
+                false,
+            );
+        }
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            return write_html_response(
+                stream,
+                "403 Forbidden",
+                &delete_form_html(&url_path, Some("Path escapes served directory.")),
+                &[],
+                false,
+            );
+        }
+        Err(error) => return Err(error),
+    };
+
+    let metadata = fs::metadata(&path)?;
+    if !metadata.is_file() {
+        return write_html_response(
+            stream,
+            "400 Bad Request",
+            &delete_form_html(&url_path, Some("Only files can be deleted from this page.")),
+            &[],
+            false,
+        );
+    }
+
+    if path
+        .file_name()
+        .is_some_and(|name| name == SHARE_FILE || name == UPLOAD_FILE)
+    {
+        return write_html_response(
+            stream,
+            "403 Forbidden",
+            &delete_form_html(
+                &url_path,
+                Some("Internal Splinterparty files cannot be deleted."),
+            ),
+            &[],
+            false,
+        );
+    }
+
+    let Some((_share_dir, share)) = find_applicable_share(&config.root, &path, &metadata)? else {
+        return write_html_response(
+            stream,
+            "403 Forbidden",
+            &delete_form_html(
+                &url_path,
+                Some(
+                    "This file is not inside a protected share, so there is no read+write PIN to verify.",
+                ),
+            ),
+            &[],
+            false,
+        );
+    };
+
+    if !share.allows_write(Some(&pin)) {
+        return write_html_response(
+            stream,
+            "403 Forbidden",
+            &delete_form_html(&url_path, Some("Read+write PIN required or incorrect.")),
+            &[],
+            false,
+        );
+    }
+
+    if let Err(error) = fs::remove_file(&path) {
+        return write_html_response(
+            stream,
+            "500 Internal Server Error",
+            &delete_form_html(
+                &url_path,
+                Some(&format!(
+                    "Could not delete file. {}",
+                    write_permission_message(&url_path, &error)
+                )),
+            ),
+            &[],
+            false,
+        );
+    }
+
+    let parent_path = path
+        .parent()
+        .map(|parent| url_path_for(&config.root, parent))
+        .unwrap_or_else(|| "/".to_string());
+    write_redirect_with_cookie(stream, &parent_path, PIN_COOKIE, &pin)
+}
+
 // ── Chunked upload state ──────────────────────────────────────────────────────
 //
 // When the browser uploads a file larger than LARGE_FILE_PART_SIZE it sends
@@ -2778,6 +2920,34 @@ fn folder_form_html(path: &str, error: Option<&str>) -> String {
     body
 }
 
+fn delete_form_html(path: &str, error: Option<&str>) -> String {
+    let mut body = String::new();
+    body.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Delete file</title><style>");
+    body.push_str(DIRECTORY_CSS);
+    body.push_str(FORM_CSS);
+    body.push_str("</style></head><body><main class=\"form-page\"><section class=\"panel\"><p class=\"eyebrow\">Splinterparty</p><h1>Delete file</h1><p class=\"muted\">");
+    body.push_str(&escape_html(path));
+    body.push_str("</p>");
+    if let Some(error) = error {
+        body.push_str("<p class=\"error\">");
+        body.push_str(&escape_html(error));
+        body.push_str("</p>");
+    }
+    body.push_str(
+        "<form method=\"post\" action=\"/__delete\"><input type=\"hidden\" name=\"path\" value=\"",
+    );
+    body.push_str(&escape_html(path));
+    body.push_str("\"><label>Read+write PIN<input name=\"pin\" type=\"password\" autofocus required></label><button type=\"submit\">Delete file</button></form><p class=\"muted\">This permanently removes the file from the server directory.</p><p><a class=\"up\" href=\"");
+    let parent = path
+        .trim_end_matches('/')
+        .rsplit_once('/')
+        .map(|(parent, _)| if parent.is_empty() { "/" } else { parent })
+        .unwrap_or("/");
+    body.push_str(&escape_html(parent));
+    body.push_str("\">Cancel</a></p></section></main></body></html>");
+    body
+}
+
 fn upload_error_html(path: &str, error: &str) -> String {
     let mut body = String::new();
     body.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Upload failed</title><style>");
@@ -3040,7 +3210,15 @@ fn serve_directory(
         if !is_dir {
             body.push_str("<a href=\"");
             body.push_str(&href);
-            body.push_str("\" download>Download</a>");
+            body.push_str("\" download>Download</a> ");
+            let delete_path = format!(
+                "{}/{}",
+                url_path_for(root, path).trim_end_matches('/'),
+                url_encode_path_segment(&name)
+            );
+            body.push_str("<a href=\"/__delete?path=");
+            body.push_str(&url_encode_query_value(&delete_path));
+            body.push_str("\">Delete</a>");
         }
         body.push_str("</span></div>");
     }
