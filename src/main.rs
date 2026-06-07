@@ -3887,23 +3887,137 @@ fn share_form_html(path: &str, existing: bool, error: Option<&str>) -> String {
 
 fn folder_form_html(path: &str, error: Option<&str>) -> String {
     let mut body = String::new();
+
     body.push_str(
-        "<form method=\"post\" action=\"/__folder\" autocomplete=\"off\"><input type=\"hidden\" name=\"path\" value=\"",
+        r#"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Create folder</title>
+<style>"#,
     );
+
+    body.push_str(DIRECTORY_CSS);
+    body.push_str(FORM_CSS);
+
+    body.push_str(
+        r#"
+.folder-help {
+    margin: 0 0 14px;
+    color: #657386;
+    font-size: 14px;
+    line-height: 1.5;
+}
+
+.form-actions {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    margin-top: 4px;
+}
+
+.secondary-link {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 42px;
+    padding: 0 12px;
+    border: 1px solid #cbd5e1;
+    border-radius: 8px;
+    background: #ffffff;
+    color: #1f2937;
+    font-weight: 750;
+    text-decoration: none;
+}
+
+.secondary-link:hover {
+    text-decoration: none;
+}
+"#,
+    );
+
+    body.push_str(
+        r#"</style>
+</head>
+<body>
+<main class="form-page">
+<section class="panel">
+<p class="eyebrow">Splinterparty</p>
+<h1>Create folder</h1>
+<p class="folder-help">Create a new folder in "#,
+    );
+
     body.push_str(&escape_html(path));
-    body.push_str("\">");
 
-    body.push_str("<label>Folder name<input name=\"name\" required autocomplete=\"off\"></label>");
+    body.push_str(
+        r#". You can protect it with a guest read PIN and an elevated read+write PIN.</p>"#,
+    );
 
-    body.push_str("<label>Parent read+write PIN <span>required if this folder is inside a protected folder</span><input name=\"parent_pin\" type=\"password\" autocomplete=\"new-password\"></label>");
+    if let Some(error) = error {
+        body.push_str(r#"<p class="error">"#);
+        body.push_str(&escape_html(error));
+        body.push_str("</p>");
+    }
 
-    body.push_str("<label>Recovery password <span>required to change this folder's PINs later</span><input name=\"recovery\" type=\"password\" autocomplete=\"new-password\" required></label>");
+    body.push_str(
+        r#"<form method="post" action="/__folder" autocomplete="off">
+<input type="hidden" name="path" value=""#,
+    );
 
-    body.push_str("<label>Read PIN <span>guest access / read-only</span><input name=\"read_pin\" type=\"password\" autocomplete=\"new-password\" required></label>");
+    body.push_str(&escape_html(path));
 
-    body.push_str("<label>Read+write PIN <span>elevated access / upload, delete, symlink, rename</span><input name=\"write_pin\" type=\"password\" autocomplete=\"new-password\" required></label>");
+    body.push_str(
+        r#"">
 
-    body.push_str("<button type=\"submit\">Create folder</button></form>");
+<label>
+Folder name
+<span>Name of the new folder.</span>
+<input name="name" required autocomplete="off" autofocus>
+</label>
+
+<label>
+Parent read+write PIN
+<span>Required only if the current folder is protected.</span>
+<input name="parent_pin" type="password" autocomplete="new-password">
+</label>
+
+<label>
+Recovery password
+<span>Required to change this folder's PINs later.</span>
+<input name="recovery" type="password" autocomplete="new-password" required>
+</label>
+
+<label>
+Read PIN
+<span>Guest access. Allows browsing and downloading only.</span>
+<input name="read_pin" type="password" autocomplete="new-password" required>
+</label>
+
+<label>
+Read+write PIN
+<span>Elevated access. Allows upload, delete, rename, symlink, and folder changes.</span>
+<input name="write_pin" type="password" autocomplete="new-password" required>
+</label>
+
+<div class="form-actions">
+<button type="submit">Create folder</button>
+<a class="secondary-link" href=""#,
+    );
+
+    body.push_str(&escape_html(path));
+
+    body.push_str(
+        r#"">Cancel</a>
+</div>
+
+</form>
+</section>
+</main>
+</body>
+</html>"#,
+    );
+
     body
 }
 
