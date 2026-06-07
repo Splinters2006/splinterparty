@@ -15,6 +15,7 @@ const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
 const LARGE_FILE_PART_SIZE: u64 = 100 * 1024 * 1024;
 const READ_BUF_SIZE: usize = 64 * 1024;
 const SHARE_FILE: &str = ".splinterparty.share";
+const UPLOAD_FILE: &str = ".splinterparty.upload";
 const PIN_COOKIE: &str = "sp_pin";
 const DIRECTORY_CSS: &str = r#"
 :root { color-scheme: light dark; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f6f7f9; color: #171a1f; }
@@ -1400,6 +1401,11 @@ fn handle_connection(mut stream: TcpStream, config: &Config) -> io::Result<()> {
         return handle_upload_route(&mut stream, config, &request);
     }
 
+    if request.target.starts_with("/__chunk") {
+        log_request(&peer, &request, "200");
+        return handle_chunk_route(&mut stream, config, &request);
+    }
+
     if request.method != "GET" && request.method != "HEAD" {
         log_request(&peer, &request, "405");
         return write_text_response(
@@ -2221,6 +2227,348 @@ fn handle_upload_route(
     write_redirect_with_cookie(stream, &path, PIN_COOKIE, pin.as_deref().unwrap_or(""))
 }
 
+// ── Chunked upload state ──────────────────────────────────────────────────────
+//
+// When the browser uploads a file larger than LARGE_FILE_PART_SIZE it sends
+// each 100 MiB slice as a separate POST to /__chunk.  The server tracks
+// progress in a small manifest file (.splinterparty.upload) stored next to the
+// in-progress part files.  Once every part has arrived and its SHA-256 matches
+// the client-supplied digest the parts are concatenated into the final file and
+// all temporary files are removed.
+
+struct ChunkedUploadState {
+    filename: String,
+    total_parts: u32,
+    /// SHA-256 hex strings for parts that have been received, indexed by part index.
+    received: BTreeMap<u32, String>,
+}
+
+impl ChunkedUploadState {
+    fn to_text(&self) -> String {
+        let mut out = String::new();
+        let _ = writeln!(out, "version=1");
+        let _ = writeln!(out, "filename={}", self.filename);
+        let _ = writeln!(out, "total_parts={}", self.total_parts);
+        for (index, hash) in &self.received {
+            let _ = writeln!(out, "part={index},{hash}");
+        }
+        out
+    }
+
+    fn from_text(text: &str) -> io::Result<Self> {
+        let mut filename = None;
+        let mut total_parts = None;
+        let mut received = BTreeMap::new();
+
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            match key {
+                "filename" => filename = Some(value.to_string()),
+                "total_parts" => total_parts = value.parse().ok(),
+                "part" => {
+                    if let Some((idx, hash)) = value.split_once(',') {
+                        if let Ok(idx) = idx.parse::<u32>() {
+                            received.insert(idx, hash.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(Self {
+            filename: filename.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "chunked upload missing filename",
+                )
+            })?,
+            total_parts: total_parts.ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "chunked upload missing total_parts",
+                )
+            })?,
+            received,
+        })
+    }
+
+    fn is_complete(&self) -> bool {
+        self.received.len() as u32 == self.total_parts
+    }
+}
+
+fn handle_chunk_route(
+    stream: &mut TcpStream,
+    config: &Config,
+    request: &Request,
+) -> io::Result<()> {
+    if request.method != "POST" {
+        return write_text_response(
+            stream,
+            "405 Method Not Allowed",
+            "Method not allowed\n",
+            &[("Allow", "POST")],
+            false,
+        );
+    }
+
+    // Parse fields from multipart body
+    let content_type = request.header("Content-Type").unwrap_or("");
+    let boundary = match content_type
+        .split(';')
+        .map(str::trim)
+        .find_map(|p| p.strip_prefix("boundary="))
+    {
+        Some(b) => b.trim_matches('"').to_string(),
+        None => {
+            return write_text_response(
+                stream,
+                "400 Bad Request",
+                "Expected multipart/form-data\n",
+                &[],
+                false,
+            );
+        }
+    };
+
+    let chunk_req = match parse_chunk_request(&request.body, &boundary) {
+        Ok(r) => r,
+        Err(e) => {
+            return write_text_response(
+                stream,
+                "400 Bad Request",
+                &format!("Bad chunk request: {e}\n"),
+                &[],
+                false,
+            );
+        }
+    };
+
+    let pin = request_pin(request);
+    let folder = match folder_from_url_path(&config.root, &chunk_req.path) {
+        Ok(f) => f,
+        Err(_) => {
+            return write_text_response(
+                stream,
+                "400 Bad Request",
+                "Invalid upload path\n",
+                &[],
+                false,
+            );
+        }
+    };
+
+    // Auth check
+    let folder_meta = fs::metadata(&folder)?;
+    if let Some((_share_dir, share)) = find_applicable_share(&config.root, &folder, &folder_meta)? {
+        if !share.allows_write(pin.as_deref()) {
+            return write_text_response(
+                stream,
+                "403 Forbidden",
+                "PIN required to upload here\n",
+                &[],
+                false,
+            );
+        }
+    }
+
+    // Validate filename
+    if !is_safe_folder_name(&chunk_req.filename) {
+        return write_text_response(stream, "400 Bad Request", "Invalid filename\n", &[], false);
+    }
+
+    // Verify the hash the client sent matches the data we received
+    let mut hasher = Sha256::new();
+    hasher.update(&chunk_req.data);
+    let actual_hash = hex_bytes(&hasher.finish());
+    if actual_hash != chunk_req.expected_hash {
+        return write_text_response(
+            stream,
+            "400 Bad Request",
+            &format!(
+                "Hash mismatch for part {}: expected {}, got {}\n",
+                chunk_req.part_index, chunk_req.expected_hash, actual_hash
+            ),
+            &[],
+            false,
+        );
+    }
+
+    // Derive stable temp-directory name from the filename
+    let temp_dir_name = format!("{}.upload-parts", chunk_req.filename);
+    let temp_dir = folder.join(&temp_dir_name);
+    let state_path = temp_dir.join(UPLOAD_FILE);
+
+    // Check for a conflicting finished file
+    let final_target = folder.join(&chunk_req.filename);
+    if final_target.exists() {
+        return write_text_response(
+            stream,
+            "409 Conflict",
+            "A file with that name already exists.\n",
+            &[],
+            false,
+        );
+    }
+
+    // Load or create state
+    let mut state = if state_path.exists() {
+        let text = fs::read_to_string(&state_path)?;
+        let s = ChunkedUploadState::from_text(&text)?;
+        // Guard against a session reusing the same temp dir with a different filename
+        if s.filename != chunk_req.filename || s.total_parts != chunk_req.total_parts {
+            return write_text_response(
+                stream,
+                "409 Conflict",
+                "Upload session conflict: filename or part count mismatch.\n",
+                &[],
+                false,
+            );
+        }
+        s
+    } else {
+        fs::create_dir_all(&temp_dir)?;
+        ChunkedUploadState {
+            filename: chunk_req.filename.clone(),
+            total_parts: chunk_req.total_parts,
+            received: BTreeMap::new(),
+        }
+    };
+
+    // Reject duplicate parts
+    if state.received.contains_key(&chunk_req.part_index) {
+        return write_text_response(
+            stream,
+            "409 Conflict",
+            &format!("Part {} already received.\n", chunk_req.part_index),
+            &[],
+            false,
+        );
+    }
+
+    // Write part file
+    let part_path = temp_dir.join(format!("{:08}.part", chunk_req.part_index));
+    fs::write(&part_path, &chunk_req.data)?;
+
+    // Record the part in state
+    state
+        .received
+        .insert(chunk_req.part_index, actual_hash.clone());
+    fs::write(&state_path, state.to_text())?;
+
+    // If all parts are in, reassemble
+    if state.is_complete() {
+        let temp_output = folder.join(format!("{}.assembling", chunk_req.filename));
+        {
+            let mut out = File::create(&temp_output)?;
+            for idx in 0..state.total_parts {
+                let p = temp_dir.join(format!("{:08}.part", idx));
+                let mut part_file = File::open(&p)?;
+                io::copy(&mut part_file, &mut out)?;
+            }
+        }
+        fs::rename(&temp_output, &final_target)?;
+        // Clean up temp directory
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        return write_text_response(stream, "200 OK", "assembled\n", &[], false);
+    }
+
+    write_text_response(
+        stream,
+        "200 OK",
+        &format!(
+            "part {} of {} received\n",
+            chunk_req.part_index + 1,
+            chunk_req.total_parts
+        ),
+        &[],
+        false,
+    )
+}
+
+struct ChunkRequest {
+    path: String,
+    filename: String,
+    part_index: u32,
+    total_parts: u32,
+    expected_hash: String,
+    data: Vec<u8>,
+}
+
+fn parse_chunk_request(body: &[u8], boundary: &str) -> io::Result<ChunkRequest> {
+    let boundary_bytes = format!("--{boundary}").into_bytes();
+    let mut path = None;
+    let mut filename = None;
+    let mut part_index = None;
+    let mut total_parts = None;
+    let mut expected_hash = None;
+    let mut data = None;
+
+    for raw_part in split_bytes(body, &boundary_bytes).into_iter().skip(1) {
+        let mut part = raw_part;
+        if part.starts_with(b"\r\n") {
+            part = &part[2..];
+        }
+        if part.starts_with(b"--") {
+            break;
+        }
+        let Some(sep) = find_bytes(part, b"\r\n\r\n") else {
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&part[..sep]);
+        let mut value = &part[sep + 4..];
+        if value.ends_with(b"\r\n") {
+            value = &value[..value.len() - 2];
+        }
+        let disposition = headers
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("content-disposition:"))
+            .unwrap_or("");
+        let Some(name) = multipart_disposition_value(disposition, "name") else {
+            continue;
+        };
+        match name.as_str() {
+            "path" => path = Some(String::from_utf8_lossy(value).to_string()),
+            "filename" => filename = Some(String::from_utf8_lossy(value).to_string()),
+            "part_index" => part_index = String::from_utf8_lossy(value).trim().parse().ok(),
+            "total_parts" => total_parts = String::from_utf8_lossy(value).trim().parse().ok(),
+            "expected_hash" => {
+                expected_hash = Some(String::from_utf8_lossy(value).trim().to_string())
+            }
+            "data" => data = Some(value.to_vec()),
+            _ => {}
+        }
+    }
+
+    Ok(ChunkRequest {
+        path: path.unwrap_or_else(|| "/".to_string()),
+        filename: filename.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "missing filename in chunk")
+        })?,
+        part_index: part_index.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "missing part_index in chunk")
+        })?,
+        total_parts: total_parts.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "missing total_parts in chunk")
+        })?,
+        expected_hash: expected_hash.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "missing expected_hash in chunk")
+        })?,
+        data: data
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing data in chunk"))?,
+    })
+}
+
+// ── End chunked upload ────────────────────────────────────────────────────────
+
 struct UploadRequest {
     path: String,
     filename: String,
@@ -2592,7 +2940,9 @@ fn serve_directory(
     let mut entries = fs::read_dir(path)?
         .filter_map(|entry| {
             let entry = entry.ok()?;
-            if entry.file_name() == SHARE_FILE {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str == SHARE_FILE || name_str.ends_with(".upload-parts") {
                 None
             } else {
                 Some(Ok(entry))
@@ -2699,9 +3049,80 @@ fn serve_directory(
         body.push_str("<div class=\"empty\">This directory is empty.</div>");
     }
 
-    body.push_str("</section><section class=\"upload-panel\"><h2>Upload file</h2><form method=\"post\" action=\"/__upload\" enctype=\"multipart/form-data\"><input type=\"hidden\" name=\"path\" value=\"");
+    body.push_str("</section><section class=\"upload-panel\"><h2>Upload file</h2>");
+    body.push_str("<form id=\"upload-form\" method=\"post\" action=\"/__upload\" enctype=\"multipart/form-data\">");
+    body.push_str("<input type=\"hidden\" name=\"path\" value=\"");
     body.push_str(&escape_html(&url_path_for(root, path)));
-    body.push_str("\"><label>File<input name=\"file\" type=\"file\" required></label><button type=\"submit\">Upload</button></form></section></main></body></html>\n");
+    body.push_str("\">");
+    body.push_str(
+        "<label>File<input id=\"upload-file\" name=\"file\" type=\"file\" required></label>",
+    );
+    body.push_str("<button type=\"submit\">Upload</button></form>");
+    body.push_str("<div id=\"upload-progress\" style=\"display:none;margin-top:12px\">");
+    body.push_str(
+        "<div id=\"upload-status\" style=\"margin-bottom:6px;font-size:14px;color:#53606f\"></div>",
+    );
+    body.push_str(
+        "<div style=\"height:8px;border-radius:4px;background:#e7eefc;overflow:hidden\">",
+    );
+    body.push_str("<div id=\"upload-bar\" style=\"height:100%;width:0%;background:#155eef;transition:width 0.2s\"></div>");
+    body.push_str("</div></div>");
+
+    // Encode the current folder path for use inside the JS string
+    let folder_url_path = escape_html(&url_path_for(root, path));
+
+    body.push_str("<script>");
+    body.push_str("(function(){");
+    body.push_str("const PART=100*1024*1024;");
+    body.push_str("const form=document.getElementById('upload-form');");
+    body.push_str("const fileInput=document.getElementById('upload-file');");
+    body.push_str("const progress=document.getElementById('upload-progress');");
+    body.push_str("const bar=document.getElementById('upload-bar');");
+    body.push_str("const status=document.getElementById('upload-status');");
+    body.push_str("async function sha256hex(buf){");
+    body.push_str("  const digest=await crypto.subtle.digest('SHA-256',buf);");
+    body.push_str("  return Array.from(new Uint8Array(digest)).map(b=>b.toString(16).padStart(2,'0')).join('');");
+    body.push_str("}");
+    body.push_str("form.addEventListener('submit',async function(e){");
+    body.push_str("  const file=fileInput.files[0];");
+    body.push_str("  if(!file||file.size<=PART){return;}"); // small files use normal form POST
+    body.push_str("  e.preventDefault();");
+    body.push_str("  form.querySelector('button').disabled=true;");
+    body.push_str("  progress.style.display='block';");
+    body.push_str("  const totalParts=Math.ceil(file.size/PART);");
+    body.push_str("  const folderPath='");
+    body.push_str(&folder_url_path);
+    body.push_str("';");
+    body.push_str("  for(let i=0;i<totalParts;i++){");
+    body.push_str("    const start=i*PART;");
+    body.push_str("    const slice=file.slice(start,start+PART);");
+    body.push_str("    const buf=await slice.arrayBuffer();");
+    body.push_str("    const hash=await sha256hex(buf);");
+    body.push_str("    status.textContent='Uploading part '+(i+1)+' of '+totalParts+'…';");
+    body.push_str("    bar.style.width=(i/totalParts*100).toFixed(1)+'%';");
+    body.push_str("    const fd=new FormData();");
+    body.push_str("    fd.append('path',folderPath);");
+    body.push_str("    fd.append('filename',file.name);");
+    body.push_str("    fd.append('part_index',String(i));");
+    body.push_str("    fd.append('total_parts',String(totalParts));");
+    body.push_str("    fd.append('expected_hash',hash);");
+    body.push_str("    fd.append('data',new Blob([buf]));");
+    body.push_str("    const resp=await fetch('/__chunk',{method:'POST',body:fd});");
+    body.push_str("    if(!resp.ok){");
+    body.push_str("      status.textContent='Error on part '+(i+1)+': '+(await resp.text());");
+    body.push_str("      status.style.color='#991b1b';");
+    body.push_str("      form.querySelector('button').disabled=false;");
+    body.push_str("      return;");
+    body.push_str("    }");
+    body.push_str("  }");
+    body.push_str("  bar.style.width='100%';");
+    body.push_str("  status.textContent='Upload complete — assembling file…';");
+    body.push_str("  setTimeout(()=>window.location.reload(),800);");
+    body.push_str("});");
+    body.push_str("})();");
+    body.push_str("</script>");
+
+    body.push_str("</section></main></body></html>\n");
 
     write_text_response(
         stream,
