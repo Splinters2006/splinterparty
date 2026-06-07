@@ -1464,6 +1464,11 @@ fn handle_connection(mut stream: TcpStream, config: &Config) -> io::Result<()> {
         return handle_move_route(&mut stream, config, &request);
     }
 
+    if request.target.starts_with("/__copy") {
+        log_request(&peer, &request, "200");
+        return handle_copy_route(&mut stream, config, &request);
+    }
+
     if request.method != "GET" && request.method != "HEAD" {
         log_request(&peer, &request, "405");
         return write_text_response(
@@ -1555,11 +1560,11 @@ fn handle_connection(mut stream: TcpStream, config: &Config) -> io::Result<()> {
     };
 
     if !requested_is_symlink {
-        if let Some((_share_dir, share)) = find_applicable_share(&config.root, &path, &metadata)? {
-            let pin = request_pin(&request);
-            if !share.allows_read(pin.as_deref()) {
-                log_request(&peer, &request, "401");
-                return write_html_response(
+    let pin = request_pin(&request);
+    if let Some((_share_dir, share)) = find_applicable_share(&config.root, &path, &metadata)? {
+        if !share.allows_read(pin.as_deref()) {
+            log_request(&peer, &request, "401");
+            return write_html_response(
                     &mut stream,
                     "401 Unauthorized",
                     &pin_prompt_html(&request.target, true),
@@ -1577,6 +1582,7 @@ fn handle_connection(mut stream: TcpStream, config: &Config) -> io::Result<()> {
             &config.root,
             &path,
             config.port(),
+            pin.as_deref(),
             request.method == "HEAD",
         );
     }
@@ -2880,7 +2886,11 @@ fn handle_move_route(stream: &mut TcpStream, config: &Config, request: &Request)
     let form = String::from_utf8_lossy(&request.body);
     let source_path = form_value(&form, "source").unwrap_or_default();
     let destination_path = form_value(&form, "destination").unwrap_or_default();
-    let pin = form_value(&form, "pin")
+    let source_pin = form_value(&form, "source_pin")
+        .filter(|pin| !pin.is_empty())
+        .or_else(|| request_pin(request))
+        .unwrap_or_default();
+    let destination_pin = form_value(&form, "destination_pin")
         .filter(|pin| !pin.is_empty())
         .or_else(|| request_pin(request))
         .unwrap_or_default();
@@ -2912,18 +2922,26 @@ fn handle_move_route(stream: &mut TcpStream, config: &Config, request: &Request)
     };
 
     let destination_metadata = fs::metadata(&destination)?;
-    if !share_allows_write(&config.root, &source, &source_metadata, Some(&pin))?
-        || !share_allows_write(
-            &config.root,
-            &destination,
-            &destination_metadata,
-            Some(&pin),
-        )?
-    {
+    if !share_allows_write(&config.root, &source, &source_metadata, Some(&source_pin))? {
         return write_text_response(
             stream,
             "403 Forbidden",
-            "Read+write PIN required or incorrect.\n",
+            "Source folder read+write PIN required or incorrect.\n",
+            &[],
+            false,
+        );
+    }
+
+    if !share_allows_write(
+        &config.root,
+        &destination,
+        &destination_metadata,
+        Some(&destination_pin),
+    )? {
+        return write_text_response(
+            stream,
+            "403 Forbidden",
+            "Destination folder read+write PIN required or incorrect.\n",
             &[],
             false,
         );
@@ -3006,6 +3024,119 @@ fn move_error_status(error: &io::Error) -> &'static str {
         io::ErrorKind::PermissionDenied => "403 Forbidden",
         _ => "500 Internal Server Error",
     }
+}
+
+fn handle_copy_route(stream: &mut TcpStream, config: &Config, request: &Request) -> io::Result<()> {
+    if request.method != "POST" {
+        return write_text_response(
+            stream,
+            "405 Method Not Allowed",
+            "Method not allowed\n",
+            &[("Allow", "POST")],
+            false,
+        );
+    }
+
+    let form = String::from_utf8_lossy(&request.body);
+    let source_path = form_value(&form, "source").unwrap_or_default();
+    let destination_path = form_value(&form, "destination").unwrap_or_default();
+    let destination_pin = form_value(&form, "destination_pin")
+        .filter(|pin| !pin.is_empty())
+        .or_else(|| request_pin(request))
+        .unwrap_or_default();
+
+    let (source, source_metadata) = match move_source(&config.root, &source_path) {
+        Ok(source) => source,
+        Err(error) => {
+            return write_text_response(
+                stream,
+                move_error_status(&error),
+                &format!("Could not copy source: {error}\n"),
+                &[],
+                false,
+            );
+        }
+    };
+
+    let destination = match folder_from_url_path(&config.root, &destination_path) {
+        Ok(destination) => destination,
+        Err(error) => {
+            return write_text_response(
+                stream,
+                move_error_status(&error),
+                &format!("Could not open destination folder: {error}\n"),
+                &[],
+                false,
+            );
+        }
+    };
+
+    let destination_metadata = fs::metadata(&destination)?;
+    if !share_allows_write(
+        &config.root,
+        &destination,
+        &destination_metadata,
+        Some(&destination_pin),
+    )? {
+        return write_text_response(
+            stream,
+            "403 Forbidden",
+            "Destination folder read+write PIN required or incorrect.\n",
+            &[],
+            false,
+        );
+    }
+
+    let file_name = source
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad source path"))?;
+    let target = destination.join(file_name);
+    if target.exists() || fs::symlink_metadata(&target).is_ok() {
+        return write_text_response(
+            stream,
+            "409 Conflict",
+            "A file or symlink with that name already exists in the destination.\n",
+            &[],
+            false,
+        );
+    }
+
+    if source_metadata.file_type().is_symlink() {
+        let link_target = fs::read_link(&source)?;
+        #[cfg(unix)]
+        {
+            if let Err(error) = std::os::unix::fs::symlink(link_target, &target) {
+                return write_text_response(
+                    stream,
+                    "500 Internal Server Error",
+                    &format!("Could not copy symlink: {error}\n"),
+                    &[],
+                    false,
+                );
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            return write_text_response(
+                stream,
+                "500 Internal Server Error",
+                "Copying symlinks is currently supported only on Unix/Linux.\n",
+                &[],
+                false,
+            );
+        }
+    } else if let Err(error) = fs::copy(&source, &target) {
+        return write_text_response(
+            stream,
+            "500 Internal Server Error",
+            &format!("Could not copy file: {error}\n"),
+            &[],
+            false,
+        );
+    }
+
+    write_text_response(stream, "204 No Content", "", &[], false)
 }
 
 // ── Chunked upload state ──────────────────────────────────────────────────────
@@ -3949,6 +4080,7 @@ fn serve_directory(
     root: &Path,
     path: &Path,
     bind_port: u16,
+    pin: Option<&str>,
     skip_body: bool,
 ) -> io::Result<()> {
     let mut entries = fs::read_dir(path)?
@@ -3980,6 +4112,8 @@ fn serve_directory(
         format!("/{}", relative.display())
     };
     let entry_count = entries.len();
+    let directory_metadata = fs::metadata(path)?;
+    let can_write_here = share_allows_write(root, path, &directory_metadata, pin)?;
 
     let mut body = String::new();
     body.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
@@ -4018,7 +4152,9 @@ fn serve_directory(
         body.push_str(&escape_html(&parent_url_path));
         body.push_str(r#"" data-delete-path=""#);
         body.push_str(&escape_html(&parent_url_path));
-        body.push_str(r#"" data-is-dir="1" data-download="0" data-delete="0" data-can-symlink="0" data-can-drag="0" data-drop-target="1"><a class="name" href="../"><span class="icon">DIR</span><span>..</span></a><span class="type">Parent folder</span><span>-</span><span>-</span></div>"#);
+        body.push_str(r#"" data-is-dir="1" data-download="0" data-delete="0" data-can-symlink="0" data-can-drag="0" data-drop-target=""#);
+        body.push_str(if can_write_here { "1" } else { "0" });
+        body.push_str(r#""><a class="name" href="../"><span class="icon">DIR</span><span>..</span></a><span class="type">Parent folder</span><span>-</span><span>-</span></div>"#);
     }
 
     for entry in entries {
@@ -4039,9 +4175,13 @@ fn serve_directory(
                         url_encode_path_segment(&name)
                     );
                     body.push_str(&escape_html(&delete_path));
-                    body.push_str(
-                        r#"" data-is-dir="0" data-download="1" data-delete="1" data-can-symlink="0" data-can-drag="0" data-drop-target="0"><a class="name" href=""#,
-                    );
+                    body.push_str(r#"" data-is-dir="0" data-download="1" data-delete="1" data-can-symlink="0" data-can-drag=""#);
+                    body.push_str(if can_write_here { "1" } else { "0" });
+                    body.push_str(r#"" data-drop-target="0""#);
+                    if can_write_here {
+                        body.push_str(r#" draggable="true""#);
+                    }
+                    body.push_str(r#"><a class="name" href=""#);
                     body.push_str(&escape_html(&href));
                     body.push_str(r#""><span class="icon">NET</span><span>"#);
                     body.push_str(&escape_html(&link.name));
@@ -4098,10 +4238,14 @@ fn serve_directory(
         body.push_str("\" data-can-symlink=\"");
         body.push_str(if !is_dir { "1" } else { "0" });
         body.push_str("\" data-can-drag=\"");
-        let can_drag = !is_dir || is_symlink;
+        let can_drag = can_write_here && (!is_dir || is_symlink);
         body.push_str(if can_drag { "1" } else { "0" });
         body.push_str("\" data-drop-target=\"");
-        body.push_str(if is_dir && !is_symlink { "1" } else { "0" });
+        body.push_str(if can_write_here && is_dir && !is_symlink {
+            "1"
+        } else {
+            "0"
+        });
         if can_drag {
             body.push_str("\" draggable=\"true");
         }
@@ -4215,13 +4359,14 @@ fn serve_directory(
     <a id="ctx-open" href="#">Open</a>
     <a id="ctx-download" href="#" download>Download</a>
     <button id="ctx-symlink" type="button">Symlink to this file…</button>
+    <button id="ctx-folder" type="button">New folder here…</button>
     <a id="ctx-delete" class="danger" href="#">Delete…</a>
     </div>"##,
     );
     body.push_str("<script>");
-    body.push_str("(function(){const menu=document.getElementById('context-menu');if(!menu)return;let current=null;const open=document.getElementById('ctx-open');const down=document.getElementById('ctx-download');const del=document.getElementById('ctx-delete');const sym=document.getElementById('ctx-symlink');function hide(){menu.style.display='none';}document.addEventListener('click',hide);document.addEventListener('keydown',e=>{if(e.key==='Escape')hide();});document.querySelectorAll('.row.item').forEach(row=>{row.addEventListener('contextmenu',e=>{e.preventDefault();current=row;const path=row.dataset.path;open.href=path;down.href=path;down.style.display=row.dataset.download==='1'?'block':'none';del.href='/__delete?path='+encodeURIComponent(row.dataset.deletePath||path);del.style.display=row.dataset.delete==='1'?'block':'none';sym.style.display=row.dataset.canSymlink==='1'?'block':'none';menu.style.left=Math.min(e.clientX,window.innerWidth-210)+'px';menu.style.top=Math.min(e.clientY,window.innerHeight-190)+'px';menu.style.display='block';});});sym.addEventListener('click',()=>{if(!current)return;hide();const target=current.dataset.path;const defaultName=current.dataset.name||'link';const name=prompt('Symlink name:', defaultName);if(!name)return;const params=new URLSearchParams({path:'");
+    body.push_str("(function(){const menu=document.getElementById('context-menu');if(!menu)return;let current=null;const currentFolder='");
     body.push_str(&folder_url_path);
-    body.push_str("',target_path:target,name:name});window.location.href='/__symlink?'+params.toString();});})();");
+    body.push_str("';const open=document.getElementById('ctx-open');const down=document.getElementById('ctx-download');const del=document.getElementById('ctx-delete');const sym=document.getElementById('ctx-symlink');const folder=document.getElementById('ctx-folder');function hide(){menu.style.display='none';}function folderTarget(){if(current&&current.dataset.isDir==='1')return current.dataset.path;return currentFolder;}document.addEventListener('click',hide);document.addEventListener('keydown',e=>{if(e.key==='Escape')hide();});document.querySelectorAll('.row.item').forEach(row=>{row.addEventListener('contextmenu',e=>{e.preventDefault();current=row;const path=row.dataset.path;open.href=path;down.href=path;down.style.display=row.dataset.download==='1'?'block':'none';del.href='/__delete?path='+encodeURIComponent(row.dataset.deletePath||path);del.style.display=row.dataset.delete==='1'?'block':'none';sym.style.display=row.dataset.canSymlink==='1'?'block':'none';menu.style.left=Math.min(e.clientX,window.innerWidth-220)+'px';menu.style.top=Math.min(e.clientY,window.innerHeight-230)+'px';menu.style.display='block';});});sym.addEventListener('click',()=>{if(!current)return;hide();const target=current.dataset.path;const defaultName=current.dataset.name||'link';const name=prompt('Symlink name:', defaultName);if(!name)return;const params=new URLSearchParams({path:currentFolder,target_path:target,name:name});window.location.href='/__symlink?'+params.toString();});folder.addEventListener('click',()=>{hide();window.location.href='/__folder?path='+encodeURIComponent(folderTarget());});})();");
     body.push_str("</script>");
     body.push_str("<script>");
     body.push_str("(function(){let dragged=null;async function moveItem(source,destination,pin){const body=new URLSearchParams({source:source,destination:destination});if(pin)body.set('pin',pin);return fetch('/__move',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});}async function dropMove(source,destination){let resp=await moveItem(source,destination,'');if(resp.status===403){const pin=prompt('Read+write PIN for the source and destination folders:');if(pin===null)return;resp=await moveItem(source,destination,pin);}if(resp.ok||resp.status===204){window.location.reload();return;}alert((await resp.text())||'Could not move item.');}document.querySelectorAll('.row.item').forEach(row=>{if(row.dataset.canDrag==='1'){row.addEventListener('dragstart',e=>{dragged=row;row.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',row.dataset.path);});row.addEventListener('dragend',()=>{row.classList.remove('dragging');dragged=null;document.querySelectorAll('.drop-target').forEach(el=>el.classList.remove('drop-target'));});}if(row.dataset.dropTarget==='1'){row.addEventListener('dragover',e=>{if(!dragged||dragged===row)return;e.preventDefault();e.dataTransfer.dropEffect='move';row.classList.add('drop-target');});row.addEventListener('dragleave',()=>row.classList.remove('drop-target'));row.addEventListener('drop',e=>{if(!dragged||dragged===row)return;e.preventDefault();row.classList.remove('drop-target');const source=dragged.dataset.path;const destination=row.dataset.path;dropMove(source,destination);});}});})();");
