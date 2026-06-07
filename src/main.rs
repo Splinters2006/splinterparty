@@ -1,4 +1,4 @@
- use std::collections::BTreeMap;
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsStr;
 use std::fmt::Write as _;
@@ -54,6 +54,7 @@ a:hover { text-decoration: underline; }
 .context-menu button:active, .context-menu a:active { background: #ffffff; color: #111827; }
 .context-menu .danger { color: #991b1b; }
 .row.item[draggable="true"] { user-select: none; }
+.row.item.selected { background: #eef2ff; }
 .row.item.dragging { opacity: .55; }
 .row.item.drop-target { outline: 2px solid #155eef; outline-offset: -2px; background: #eef2ff; }
 .preview { position: fixed; inset: 0; z-index: 1200; display: none; grid-template-rows: auto 1fr; background: rgba(15, 23, 42, .86); color: #ffffff; }
@@ -2659,18 +2660,14 @@ fn handle_upload_route(
 
     let upload = parse_upload_request(request)?;
     let path = upload.path;
-    let filename = upload.filename;
-    let contents = upload.contents;
+    let files = upload.files;
     let pin = request_pin(request);
 
-    if !is_safe_folder_name(&filename) {
+    if files.is_empty() {
         return write_html_response(
             stream,
             "400 Bad Request",
-            &upload_error_html(
-                &path,
-                "Filename cannot be empty or contain path separators.",
-            ),
+            &upload_error_html(&path, "Choose at least one file to upload."),
             &[],
             false,
         );
@@ -2704,36 +2701,56 @@ fn handle_upload_route(
         }
     }
 
-    let upload_hash = hash_bytes(&contents);
-    let target = match unique_upload_target(&folder, &filename, &upload_hash) {
-        Ok(target) => target,
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+    for file in files {
+        if !is_safe_folder_name(&file.filename) {
             return write_html_response(
                 stream,
-                "409 Conflict",
-                &upload_error_html(&path, "That exact file already exists."),
+                "400 Bad Request",
+                &upload_error_html(
+                    &path,
+                    "Filenames cannot be empty or contain path separators.",
+                ),
                 &[],
                 false,
             );
         }
-        Err(error) => return Err(error),
-    };
 
-    if let Err(error) = fs::write(&target, &contents) {
-        return write_html_response(
-            stream,
-            "500 Internal Server Error",
-            &upload_error_html(
-                &path,
-                &format!(
-                    "Could not save upload. {}",
-                    write_permission_message(&path, &error)
+        let upload_hash = hash_bytes(&file.contents);
+        let target = match unique_upload_target(&folder, &file.filename, &upload_hash) {
+            Ok(target) => target,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                return write_html_response(
+                    stream,
+                    "409 Conflict",
+                    &upload_error_html(
+                        &path,
+                        &format!("{} already exists with identical contents.", file.filename),
+                    ),
+                    &[],
+                    false,
+                );
+            }
+            Err(error) => return Err(error),
+        };
+
+        if let Err(error) = fs::write(&target, &file.contents) {
+            return write_html_response(
+                stream,
+                "500 Internal Server Error",
+                &upload_error_html(
+                    &path,
+                    &format!(
+                        "Could not save {}. {}",
+                        file.filename,
+                        write_permission_message(&path, &error)
+                    ),
                 ),
-            ),
-            &[],
-            false,
-        );
+                &[],
+                false,
+            );
+        }
     }
+
     write_redirect_with_cookie(stream, &path, PIN_COOKIE, pin.as_deref().unwrap_or(""))
 }
 
@@ -3521,6 +3538,10 @@ fn parse_chunk_request(body: &[u8], boundary: &str) -> io::Result<ChunkRequest> 
 
 struct UploadRequest {
     path: String,
+    files: Vec<UploadedFile>,
+}
+
+struct UploadedFile {
     filename: String,
     contents: Vec<u8>,
 }
@@ -3538,18 +3559,19 @@ fn parse_upload_request(request: &Request) -> io::Result<UploadRequest> {
     let form = String::from_utf8_lossy(&request.body);
     Ok(UploadRequest {
         path: form_value(&form, "path").unwrap_or_else(|| "/".to_string()),
-        filename: form_value(&form, "filename").unwrap_or_default(),
-        contents: form_value(&form, "contents")
-            .unwrap_or_default()
-            .into_bytes(),
+        files: vec![UploadedFile {
+            filename: form_value(&form, "filename").unwrap_or_default(),
+            contents: form_value(&form, "contents")
+                .unwrap_or_default()
+                .into_bytes(),
+        }],
     })
 }
 
 fn parse_multipart_upload(body: &[u8], boundary: &str) -> io::Result<UploadRequest> {
     let boundary = format!("--{boundary}").into_bytes();
     let mut path = None;
-    let mut filename = None;
-    let mut contents = None;
+    let mut files = Vec::new();
 
     for raw_part in split_bytes(body, &boundary).into_iter().skip(1) {
         let mut part = raw_part;
@@ -3582,12 +3604,18 @@ fn parse_multipart_upload(body: &[u8], boundary: &str) -> io::Result<UploadReque
         match name.as_str() {
             "path" => path = Some(String::from_utf8_lossy(value).to_string()),
             "file" => {
-                filename = multipart_disposition_value(disposition, "filename").and_then(|name| {
-                    Path::new(&name)
-                        .file_name()
-                        .map(|name| name.to_string_lossy().to_string())
-                });
-                contents = Some(value.to_vec());
+                let filename =
+                    multipart_disposition_value(disposition, "filename").and_then(|name| {
+                        Path::new(&name)
+                            .file_name()
+                            .map(|name| name.to_string_lossy().to_string())
+                    });
+                if let Some(filename) = filename.filter(|name| !name.is_empty()) {
+                    files.push(UploadedFile {
+                        filename,
+                        contents: value.to_vec(),
+                    });
+                }
             }
             _ => {}
         }
@@ -3595,8 +3623,7 @@ fn parse_multipart_upload(body: &[u8], boundary: &str) -> io::Result<UploadReque
 
     Ok(UploadRequest {
         path: path.unwrap_or_else(|| "/".to_string()),
-        filename: filename.unwrap_or_default(),
-        contents: contents.unwrap_or_default(),
+        files,
     })
 }
 
@@ -4327,7 +4354,7 @@ fn serve_directory(
     body.push_str(&escape_html(&url_path_for(root, path)));
     body.push_str("\">");
     body.push_str(
-        "<label>File<input id=\"upload-file\" name=\"file\" type=\"file\" required></label>",
+        "<label>Files<input id=\"upload-file\" name=\"file\" type=\"file\" multiple required></label>",
     );
     body.push_str("<button type=\"submit\">Upload</button></form>");
     body.push_str("<div id=\"upload-progress\" style=\"display:none;margin-top:12px\">");
@@ -4355,12 +4382,7 @@ fn serve_directory(
     body.push_str("  const digest=await crypto.subtle.digest('SHA-256',buf);");
     body.push_str("  return Array.from(new Uint8Array(digest)).map(b=>b.toString(16).padStart(2,'0')).join('');");
     body.push_str("}");
-    body.push_str("form.addEventListener('submit',async function(e){");
-    body.push_str("  const file=fileInput.files[0];");
-    body.push_str("  if(!file||file.size<=PART){return;}"); // small files use normal form POST
-    body.push_str("  e.preventDefault();");
-    body.push_str("  form.querySelector('button').disabled=true;");
-    body.push_str("  progress.style.display='block';");
+    body.push_str("async function uploadLargeFile(file,index,totalFiles){");
     body.push_str("  const totalParts=Math.ceil(file.size/PART);");
     body.push_str("  const folderPath='");
     body.push_str(&folder_url_path);
@@ -4370,8 +4392,8 @@ fn serve_directory(
     body.push_str("    const slice=file.slice(start,start+PART);");
     body.push_str("    const buf=await slice.arrayBuffer();");
     body.push_str("    const hash=await sha256hex(buf);");
-    body.push_str("    status.textContent='Uploading part '+(i+1)+' of '+totalParts+'…';");
-    body.push_str("    bar.style.width=(i/totalParts*100).toFixed(1)+'%';");
+    body.push_str("    status.textContent='Uploading '+file.name+' ('+(index+1)+' of '+totalFiles+'), part '+(i+1)+' of '+totalParts+'…';");
+    body.push_str("    bar.style.width=(((index+i/totalParts)/totalFiles)*100).toFixed(1)+'%';");
     body.push_str("    const fd=new FormData();");
     body.push_str("    fd.append('path',folderPath);");
     body.push_str("    fd.append('filename',file.name);");
@@ -4380,21 +4402,31 @@ fn serve_directory(
     body.push_str("    fd.append('expected_hash',hash);");
     body.push_str("    fd.append('data',new Blob([buf]));");
     body.push_str("    const resp=await fetch('/__chunk',{method:'POST',body:fd});");
-    body.push_str("    if(!resp.ok){");
-    body.push_str("      status.textContent='Error on part '+(i+1)+': '+(await resp.text());");
-    body.push_str("      status.style.color='#991b1b';");
-    body.push_str("      form.querySelector('button').disabled=false;");
-    body.push_str("      return;");
-    body.push_str("    }");
+    body.push_str("    if(!resp.ok){throw new Error('Error uploading '+file.name+' part '+(i+1)+': '+(await resp.text()));}");
     body.push_str("  }");
-    body.push_str("  bar.style.width='100%';");
-    body.push_str("  status.textContent='Upload complete — assembling file…';");
-    body.push_str("  setTimeout(()=>window.location.reload(),800);");
+    body.push_str("}");
+    body.push_str("form.addEventListener('submit',async function(e){");
+    body.push_str("  const files=Array.from(fileInput.files||[]);");
+    body.push_str("  if(files.length===0||files.every(file=>file.size<=PART)){return;}"); // small files use normal form POST
+    body.push_str("  e.preventDefault();");
+    body.push_str("  form.querySelector('button').disabled=true;");
+    body.push_str("  progress.style.display='block';");
+    body.push_str("  try{");
+    body.push_str("    for(let i=0;i<files.length;i++){");
+    body.push_str("      const file=files[i];");
+    body.push_str("      if(file.size<=PART){const fd=new FormData();fd.append('path','");
+    body.push_str(&folder_url_path);
+    body.push_str("');fd.append('file',file,file.name);const resp=await fetch('/__upload',{method:'POST',body:fd});if(!resp.ok){throw new Error(await resp.text());}}else{await uploadLargeFile(file,i,files.length);}");
+    body.push_str("      bar.style.width=(((i+1)/files.length)*100).toFixed(1)+'%';");
+    body.push_str("    }");
+    body.push_str("    status.textContent='Upload complete — refreshing…';");
+    body.push_str("    setTimeout(()=>window.location.reload(),800);");
+    body.push_str("  }catch(error){status.textContent=error.message;status.style.color='#991b1b';form.querySelector('button').disabled=false;}");
     body.push_str("});");
     body.push_str("})();");
     body.push_str("</script>");
     body.push_str("<script>");
-    body.push_str("(function(){const overlay=document.getElementById('preview');const stage=document.getElementById('preview-stage');if(!overlay||!stage)return;const title=document.getElementById('preview-title');const open=document.getElementById('preview-open');const down=document.getElementById('preview-download');const close=document.getElementById('preview-close');function hide(){overlay.classList.remove('open');overlay.setAttribute('aria-hidden','true');stage.innerHTML='';}function show(row){const kind=row.dataset.preview;if(!kind)return false;const src=row.dataset.path;const name=row.dataset.name||src;stage.innerHTML='';title.textContent=name;open.href=src;down.href=src;let el;if(kind==='image'){el=document.createElement('img');el.alt=name;el.src=src;}else if(kind==='video'){el=document.createElement('video');el.src=src;el.controls=true;el.autoplay=true;el.playsInline=true;}else if(kind==='pdf'){el=document.createElement('iframe');el.src=src;}else{return false;}stage.appendChild(el);overlay.classList.add('open');overlay.setAttribute('aria-hidden','false');return true;}close.addEventListener('click',hide);overlay.addEventListener('click',e=>{if(e.target===overlay)hide();});document.addEventListener('keydown',e=>{if(e.key==='Escape')hide();});document.querySelectorAll('.row.item').forEach(row=>{const link=row.querySelector('a.name');if(!link)return;link.addEventListener('click',e=>{if(show(row))e.preventDefault();});});})();");
+    body.push_str("(function(){const overlay=document.getElementById('preview');const stage=document.getElementById('preview-stage');if(!overlay||!stage)return;const title=document.getElementById('preview-title');const open=document.getElementById('preview-open');const down=document.getElementById('preview-download');const close=document.getElementById('preview-close');function hide(){overlay.classList.remove('open');overlay.setAttribute('aria-hidden','true');stage.innerHTML='';}function show(row){const kind=row.dataset.preview;if(!kind)return false;const src=row.dataset.path;const name=row.dataset.name||src;stage.innerHTML='';title.textContent=name;open.href=src;down.href=src;let el;if(kind==='image'){el=document.createElement('img');el.alt=name;el.src=src;}else if(kind==='video'){el=document.createElement('video');el.src=src;el.controls=true;el.autoplay=true;el.playsInline=true;}else if(kind==='pdf'){el=document.createElement('iframe');el.src=src;}else{return false;}stage.appendChild(el);overlay.classList.add('open');overlay.setAttribute('aria-hidden','false');return true;}close.addEventListener('click',hide);overlay.addEventListener('click',e=>{if(e.target===overlay)hide();});document.addEventListener('keydown',e=>{if(e.key==='Escape')hide();});document.querySelectorAll('.row.item').forEach(row=>{const link=row.querySelector('a.name');if(!link)return;link.addEventListener('click',e=>{if(e.ctrlKey||e.metaKey||e.shiftKey)return;if(show(row))e.preventDefault();});});})();");
     body.push_str("</script>");
 
     body.push_str(
@@ -4414,10 +4446,10 @@ fn serve_directory(
     body.push_str(&folder_url_path);
     body.push_str("';const canWrite=");
     body.push_str(if can_write_here { "true" } else { "false" });
-    body.push_str(";const clipKey='splinterparty.clipboard';let clip=loadClip();const open=document.getElementById('ctx-open');const down=document.getElementById('ctx-download');const del=document.getElementById('ctx-delete');const sym=document.getElementById('ctx-symlink');const copy=document.getElementById('ctx-copy');const cut=document.getElementById('ctx-cut');const paste=document.getElementById('ctx-paste');const folder=document.getElementById('ctx-folder');function loadClip(){try{return JSON.parse(sessionStorage.getItem(clipKey)||'null');}catch(_){return null;}}function saveClip(value){clip=value;if(value){sessionStorage.setItem(clipKey,JSON.stringify(value));}else{sessionStorage.removeItem(clipKey);}}function hide(){menu.style.display='none';}function folderTarget(){if(current&&current.dataset.isDir==='1')return current.dataset.path;return currentFolder;}function canClip(row){return canWrite&&row&&row.dataset.canDrag==='1';}async function postTransfer(endpoint,source,destination,destinationPin){const body=new URLSearchParams({source:source,destination:destination});if(destinationPin)body.set('destination_pin',destinationPin);return fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});}async function transfer(endpoint,source,destination){let resp=await postTransfer(endpoint,source,destination,'');if(resp.status===403){const text=await resp.text();if(text.includes('Destination folder')){const pin=prompt('Read+write PIN for the destination folder:');if(pin===null)return;resp=await postTransfer(endpoint,source,destination,pin);}else{alert(text||'Could not complete operation.');return;}}if(resp.ok||resp.status===204){window.location.reload();return;}alert((await resp.text())||'Could not complete operation.');}document.addEventListener('click',hide);document.addEventListener('keydown',e=>{if(e.key==='Escape')hide();});document.querySelectorAll('.row.item').forEach(row=>{row.addEventListener('contextmenu',e=>{e.preventDefault();clip=loadClip();current=row;const path=row.dataset.path;open.href=path;down.href=path;down.style.display=row.dataset.download==='1'?'block':'none';del.href='/__delete?path='+encodeURIComponent(row.dataset.deletePath||path);del.style.display=row.dataset.delete==='1'?'block':'none';sym.style.display=row.dataset.canSymlink==='1'?'block':'none';copy.style.display=canClip(row)?'block':'none';cut.style.display=canClip(row)?'block':'none';paste.style.display=canWrite&&clip?'block':'none';folder.style.display=canWrite?'block':'none';menu.style.left=Math.min(e.clientX,window.innerWidth-220)+'px';menu.style.top=Math.min(e.clientY,window.innerHeight-270)+'px';menu.style.display='block';});});sym.addEventListener('click',()=>{if(!current)return;hide();const target=current.dataset.path;const defaultName=current.dataset.name||'link';const name=prompt('Symlink name:', defaultName);if(!name)return;const params=new URLSearchParams({path:currentFolder,target_path:target,name:name});window.location.href='/__symlink?'+params.toString();});copy.addEventListener('click',()=>{if(!canClip(current))return;saveClip({path:current.dataset.path,mode:'copy'});hide();});cut.addEventListener('click',()=>{if(!canClip(current))return;saveClip({path:current.dataset.path,mode:'cut'});hide();});paste.addEventListener('click',()=>{clip=loadClip();if(!canWrite||!clip)return;const dest=folderTarget();const endpoint=clip.mode==='cut'?'/__move':'/__copy';const source=clip.path;if(clip.mode==='cut')saveClip(null);hide();transfer(endpoint,source,dest);});folder.addEventListener('click',()=>{hide();window.location.href='/__folder?path='+encodeURIComponent(folderTarget());});window.splinterTransfer=transfer;})();");
+    body.push_str(";const clipKey='splinterparty.clipboard';let clip=loadClip();let lastSelected=null;const rows=Array.from(document.querySelectorAll('.row.item'));const open=document.getElementById('ctx-open');const down=document.getElementById('ctx-download');const del=document.getElementById('ctx-delete');const sym=document.getElementById('ctx-symlink');const copy=document.getElementById('ctx-copy');const cut=document.getElementById('ctx-cut');const paste=document.getElementById('ctx-paste');const folder=document.getElementById('ctx-folder');function loadClip(){try{return JSON.parse(sessionStorage.getItem(clipKey)||'null');}catch(_){return null;}}function saveClip(value){clip=value;if(value){sessionStorage.setItem(clipKey,JSON.stringify(value));}else{sessionStorage.removeItem(clipKey);}}function hide(){menu.style.display='none';}function folderTarget(){if(current&&current.dataset.isDir==='1')return current.dataset.path;return currentFolder;}function canClip(row){return canWrite&&row&&row.dataset.canDrag==='1';}function selectedRows(){return rows.filter(row=>row.classList.contains('selected')&&canClip(row));}function operationRows(row){const selected=selectedRows();if(selected.length&&row&&row.classList.contains('selected'))return selected;if(canClip(row))return [row];return [];}function setSelected(row,on){if(!canClip(row))return;row.classList.toggle('selected',on);}function clearSelection(){rows.forEach(row=>row.classList.remove('selected'));}function selectRange(a,b){const start=rows.indexOf(a),end=rows.indexOf(b);if(start<0||end<0)return;const lo=Math.min(start,end),hi=Math.max(start,end);for(let i=lo;i<=hi;i++)setSelected(rows[i],true);}async function postTransfer(endpoint,source,destination,destinationPin){const body=new URLSearchParams({source:source,destination:destination});if(destinationPin)body.set('destination_pin',destinationPin);return fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});}async function transferMany(endpoint,sources,destination){let pin='';for(const source of sources){let resp=await postTransfer(endpoint,source,destination,pin);if(resp.status===403){const text=await resp.text();if(text.includes('Destination folder')){pin=prompt('Read+write PIN for the destination folder:')||'';if(!pin)return;resp=await postTransfer(endpoint,source,destination,pin);}else{alert(text||'Could not complete operation.');return;}}if(!(resp.ok||resp.status===204)){alert((await resp.text())||'Could not complete operation.');return;}}window.location.reload();}async function postDelete(path,pin){const body=new URLSearchParams({path:path});if(pin)body.set('pin',pin);return fetch('/__delete',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});}async function deleteMany(paths){if(!paths.length)return;if(!confirm('Delete '+paths.length+' selected items?'))return;let pin='';for(const path of paths){let resp=await postDelete(path,pin);if(resp.status===403){const text=await resp.text();if(text.includes('Read+write PIN')){pin=prompt('Read+write PIN:')||'';if(!pin)return;resp=await postDelete(path,pin);}else{alert(text||'Could not delete item.');return;}}if(!resp.ok){alert((await resp.text())||'Could not delete item.');return;}}window.location.reload();}function transfer(endpoint,source,destination){return transferMany(endpoint,[source],destination);}document.addEventListener('click',hide);document.addEventListener('keydown',e=>{if(e.key==='Escape')hide();});rows.forEach(row=>{row.addEventListener('click',e=>{if(!(e.ctrlKey||e.metaKey||e.shiftKey))return;e.preventDefault();if(e.shiftKey&&lastSelected){selectRange(lastSelected,row);}else{setSelected(row,!row.classList.contains('selected'));lastSelected=row;}});row.addEventListener('contextmenu',e=>{e.preventDefault();clip=loadClip();current=row;const path=row.dataset.path;const ops=operationRows(row);open.href=path;down.href=path;down.style.display=row.dataset.download==='1'?'block':'none';del.href='/__delete?path='+encodeURIComponent(row.dataset.deletePath||path);del.style.display=(row.dataset.delete==='1'||ops.length)?'block':'none';sym.style.display=row.dataset.canSymlink==='1'&&ops.length<=1?'block':'none';copy.style.display=ops.length?'block':'none';cut.style.display=ops.length?'block':'none';paste.style.display=canWrite&&clip?'block':'none';folder.style.display=canWrite?'block':'none';menu.style.left=Math.min(e.clientX,window.innerWidth-220)+'px';menu.style.top=Math.min(e.clientY,window.innerHeight-270)+'px';menu.style.display='block';});});sym.addEventListener('click',()=>{if(!current)return;hide();const target=current.dataset.path;const defaultName=current.dataset.name||'link';const name=prompt('Symlink name:', defaultName);if(!name)return;const params=new URLSearchParams({path:currentFolder,target_path:target,name:name});window.location.href='/__symlink?'+params.toString();});copy.addEventListener('click',()=>{const ops=operationRows(current);if(!ops.length)return;saveClip({paths:ops.map(row=>row.dataset.path),mode:'copy'});hide();});cut.addEventListener('click',()=>{const ops=operationRows(current);if(!ops.length)return;saveClip({paths:ops.map(row=>row.dataset.path),mode:'cut'});hide();});paste.addEventListener('click',()=>{clip=loadClip();if(!canWrite||!clip)return;const sources=clip.paths||[clip.path];const dest=folderTarget();const endpoint=clip.mode==='cut'?'/__move':'/__copy';if(clip.mode==='cut')saveClip(null);hide();transferMany(endpoint,sources,dest);});del.addEventListener('click',e=>{const ops=operationRows(current);if(ops.length<=1)return;e.preventDefault();hide();deleteMany(ops.map(row=>row.dataset.deletePath||row.dataset.path));});folder.addEventListener('click',()=>{hide();window.location.href='/__folder?path='+encodeURIComponent(folderTarget());});window.splinterTransferMany=transferMany;window.splinterSelectedSources=()=>selectedRows().map(row=>row.dataset.path);window.splinterTransfer=transfer;})();");
     body.push_str("</script>");
     body.push_str("<script>");
-    body.push_str("(function(){let dragged=null;document.querySelectorAll('.row.item').forEach(row=>{if(row.dataset.canDrag==='1'){row.addEventListener('dragstart',e=>{dragged=row;row.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',row.dataset.path);});row.addEventListener('dragend',()=>{row.classList.remove('dragging');dragged=null;document.querySelectorAll('.drop-target').forEach(el=>el.classList.remove('drop-target'));});}if(row.dataset.dropTarget==='1'){row.addEventListener('dragover',e=>{if(!dragged||dragged===row)return;e.preventDefault();e.dataTransfer.dropEffect='move';row.classList.add('drop-target');});row.addEventListener('dragleave',()=>row.classList.remove('drop-target'));row.addEventListener('drop',e=>{if(!dragged||dragged===row)return;e.preventDefault();row.classList.remove('drop-target');const source=dragged.dataset.path;const destination=row.dataset.path;if(window.splinterTransfer)window.splinterTransfer('/__move',source,destination);});}});})();");
+    body.push_str("(function(){let dragged=null;let dragSources=[];document.querySelectorAll('.row.item').forEach(row=>{if(row.dataset.canDrag==='1'){row.addEventListener('dragstart',e=>{dragged=row;dragSources=(window.splinterSelectedSources&&row.classList.contains('selected'))?window.splinterSelectedSources():[row.dataset.path];row.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',dragSources.join('\\n'));});row.addEventListener('dragend',()=>{row.classList.remove('dragging');dragged=null;dragSources=[];document.querySelectorAll('.drop-target').forEach(el=>el.classList.remove('drop-target'));});}if(row.dataset.dropTarget==='1'){row.addEventListener('dragover',e=>{if(!dragged||dragged===row)return;e.preventDefault();e.dataTransfer.dropEffect='move';row.classList.add('drop-target');});row.addEventListener('dragleave',()=>row.classList.remove('drop-target'));row.addEventListener('drop',e=>{if(!dragged||dragged===row)return;e.preventDefault();row.classList.remove('drop-target');const destination=row.dataset.path;if(window.splinterTransferMany)window.splinterTransferMany('/__move',dragSources,destination);});}});})();");
     body.push_str("</script>");
 
     body.push_str("</section></main></body></html>\n");
@@ -4802,8 +4834,9 @@ mod tests {
         let upload = parse_multipart_upload(body, "boundary").unwrap();
 
         assert_eq!(upload.path, "/uploads");
-        assert_eq!(upload.filename, "photo.bin");
-        assert_eq!(upload.contents, b"abc\x00\xff");
+        assert_eq!(upload.files.len(), 1);
+        assert_eq!(upload.files[0].filename, "photo.bin");
+        assert_eq!(upload.files[0].contents, b"abc\x00\xff");
     }
 
     #[test]
