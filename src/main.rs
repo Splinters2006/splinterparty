@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+ use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsStr;
 use std::fmt::Write as _;
@@ -49,8 +49,9 @@ a:hover { text-decoration: underline; }
 .actions a { font-weight: 650; }
 .row.item { cursor: context-menu; }
 .context-menu { position: fixed; z-index: 1000; min-width: 190px; display: none; padding: 6px; border: 1px solid #cbd5e1; border-radius: 10px; background: #ffffff; box-shadow: 0 12px 32px rgba(15, 23, 42, .18); }
-.context-menu button, .context-menu a { display: block; width: 100%; padding: 9px 10px; border: 0; border-radius: 7px; background: transparent; color: #111827; font: inherit; font-weight: 650; text-align: left; text-decoration: none; cursor: pointer; }
-.context-menu button:hover, .context-menu a:hover { background: #eef2ff; text-decoration: none; }
+.context-menu button, .context-menu a { display: block; width: 100%; padding: 9px 10px; border: 0; border-radius: 7px; background: #ffffff; color: #111827; font: inherit; font-weight: 650; text-align: left; text-decoration: none; cursor: pointer; appearance: none; }
+.context-menu button:hover, .context-menu a:hover, .context-menu button:focus, .context-menu a:focus { background: #ffffff; color: #111827; outline: 1px solid #d9dee7; text-decoration: none; }
+.context-menu button:active, .context-menu a:active { background: #ffffff; color: #111827; }
 .context-menu .danger { color: #991b1b; }
 .row.item[draggable="true"] { user-select: none; }
 .row.item.dragging { opacity: .55; }
@@ -2084,14 +2085,11 @@ fn handle_folder_route(
         .filter(|pin| !pin.is_empty())
         .or_else(|| request_pin(request));
 
-    if folder_name.is_empty() || recovery.is_empty() || write_pin.is_empty() {
+    if folder_name.is_empty() {
         return write_html_response(
             stream,
             "400 Bad Request",
-            &folder_form_html(
-                &parent_path,
-                Some("Folder name, recovery passcode, and read+write PIN are required."),
-            ),
+            &folder_form_html(&parent_path, Some("Folder name is required.")),
             &[],
             false,
         );
@@ -2186,30 +2184,48 @@ fn handle_folder_route(
             false,
         );
     }
-    let share = ShareConfig::new(
-        &recovery,
-        if read_pin.is_empty() {
-            None
-        } else {
-            Some(read_pin.as_str())
-        },
-        &write_pin,
-    );
-    if let Err(error) = fs::write(new_folder.join(SHARE_FILE), share.to_text()) {
-        let _ = fs::remove_dir(&new_folder);
-        return write_html_response(
-            stream,
-            "500 Internal Server Error",
-            &folder_form_html(
-                &parent_path,
-                Some(&format!(
-                    "Could not save folder PINs. {}",
-                    write_permission_message(&parent_path, &error)
-                )),
-            ),
-            &[],
-            false,
+    if !recovery.is_empty() || !read_pin.is_empty() || !write_pin.is_empty() {
+        if recovery.is_empty() || write_pin.is_empty() {
+            let _ = fs::remove_dir(&new_folder);
+            return write_html_response(
+                stream,
+                "400 Bad Request",
+                &folder_form_html(
+                    &parent_path,
+                    Some(
+                        "Recovery passcode and read+write PIN are required when protecting a folder.",
+                    ),
+                ),
+                &[],
+                false,
+            );
+        }
+
+        let share = ShareConfig::new(
+            &recovery,
+            if read_pin.is_empty() {
+                None
+            } else {
+                Some(read_pin.as_str())
+            },
+            &write_pin,
         );
+        if let Err(error) = fs::write(new_folder.join(SHARE_FILE), share.to_text()) {
+            let _ = fs::remove_dir(&new_folder);
+            return write_html_response(
+                stream,
+                "500 Internal Server Error",
+                &folder_form_html(
+                    &parent_path,
+                    Some(&format!(
+                        "Could not save folder PINs. {}",
+                        write_permission_message(&parent_path, &error)
+                    )),
+                ),
+                &[],
+                false,
+            );
+        }
     }
 
     let new_path = format!(
@@ -2773,7 +2789,7 @@ fn handle_delete_route(
         Err(error) => {
             let (status, message) = match error.kind() {
                 io::ErrorKind::InvalidInput => ("400 Bad Request", "Bad request path."),
-                io::ErrorKind::NotFound => ("404 Not Found", "File not found."),
+                io::ErrorKind::NotFound => ("404 Not Found", "Item not found."),
                 io::ErrorKind::PermissionDenied => {
                     ("403 Forbidden", "Path escapes served directory.")
                 }
@@ -2790,13 +2806,14 @@ fn handle_delete_route(
     };
 
     let is_symlink = metadata.file_type().is_symlink();
-    if !metadata.is_file() && !is_symlink {
+    let is_dir = metadata.is_dir();
+    if !metadata.is_file() && !is_symlink && !is_dir {
         return write_html_response(
             stream,
             "400 Bad Request",
             &delete_form_html(
                 &url_path,
-                Some("Only files and symlinks can be deleted from this page."),
+                Some("Only files, folders, and symlinks can be deleted from this page."),
                 true,
             ),
             &[],
@@ -2841,7 +2858,13 @@ fn handle_delete_route(
             false
         };
 
-    if let Err(error) = fs::remove_file(&path) {
+    let delete_result = if is_dir && !is_symlink {
+        fs::remove_dir_all(&path)
+    } else {
+        fs::remove_file(&path)
+    };
+
+    if let Err(error) = delete_result {
         return write_html_response(
             stream,
             "500 Internal Server Error",
@@ -2896,6 +2919,9 @@ fn handle_move_route(stream: &mut TcpStream, config: &Config, request: &Request)
     let source_path = form_value(&form, "source").unwrap_or_default();
     let destination_path = form_value(&form, "destination").unwrap_or_default();
     let pin = request_pin(request).unwrap_or_default();
+    let destination_pin = form_value(&form, "destination_pin")
+        .filter(|pin| !pin.is_empty())
+        .unwrap_or_else(|| pin.clone());
 
     let (source, source_metadata) = match move_source(&config.root, &source_path) {
         Ok(source) => source,
@@ -2938,7 +2964,7 @@ fn handle_move_route(stream: &mut TcpStream, config: &Config, request: &Request)
         &config.root,
         &destination,
         &destination_metadata,
-        Some(&pin),
+        Some(&destination_pin),
     )? {
         return write_text_response(
             stream,
@@ -3043,6 +3069,9 @@ fn handle_copy_route(stream: &mut TcpStream, config: &Config, request: &Request)
     let source_path = form_value(&form, "source").unwrap_or_default();
     let destination_path = form_value(&form, "destination").unwrap_or_default();
     let pin = request_pin(request).unwrap_or_default();
+    let destination_pin = form_value(&form, "destination_pin")
+        .filter(|pin| !pin.is_empty())
+        .unwrap_or_else(|| pin.clone());
 
     let (source, source_metadata) = match move_source(&config.root, &source_path) {
         Ok(source) => source,
@@ -3075,7 +3104,7 @@ fn handle_copy_route(stream: &mut TcpStream, config: &Config, request: &Request)
         &config.root,
         &destination,
         &destination_metadata,
-        Some(&pin),
+        Some(&destination_pin),
     )? {
         return write_text_response(
             stream,
@@ -3682,7 +3711,7 @@ fn folder_form_html(path: &str, error: Option<&str>) -> String {
     body.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>New folder</title><style>");
     body.push_str(DIRECTORY_CSS);
     body.push_str(FORM_CSS);
-    body.push_str("</style></head><body><main class=\"form-page\"><section class=\"panel\"><p class=\"eyebrow\">Splinterparty</p><h1>New protected folder</h1><p class=\"muted\">");
+    body.push_str("</style></head><body><main class=\"form-page\"><section class=\"panel\"><p class=\"eyebrow\">Splinterparty</p><h1>New folder</h1><p class=\"muted\">");
     body.push_str(&escape_html(path));
     body.push_str("</p>");
     if let Some(error) = error {
@@ -3694,7 +3723,7 @@ fn folder_form_html(path: &str, error: Option<&str>) -> String {
         "<form method=\"post\" action=\"/__folder\" autocomplete=\"off\"><input type=\"hidden\" name=\"path\" value=\"",
     );
     body.push_str(&escape_html(path));
-    body.push_str("\"><label>Folder name<input name=\"name\" required></label><label>Parent read+write PIN <span>required when creating inside a protected folder</span><input name=\"parent_pin\" type=\"password\" autocomplete=\"new-password\"></label><label>Recovery passcode<input name=\"recovery\" type=\"password\" autocomplete=\"new-password\" required></label><label>Read PIN <span>optional for sharing downloads</span><input name=\"read_pin\" type=\"password\" autocomplete=\"new-password\"></label><label>Read+write PIN <span>required for owner access</span><input name=\"write_pin\" type=\"password\" autocomplete=\"new-password\" required></label><button type=\"submit\">Create folder</button></form><p class=\"muted\">The recovery passcode is required to change this folder's PINs later.</p></section></main></body></html>");
+    body.push_str("\"><label>Folder name<input name=\"name\" required></label><label>Parent read+write PIN <span>required when creating inside a protected folder</span><input name=\"parent_pin\" type=\"password\" autocomplete=\"new-password\"></label><label>Recovery passcode <span>optional; required only for protected folders</span><input name=\"recovery\" type=\"password\" autocomplete=\"new-password\"></label><label>Read PIN <span>optional for protected sharing</span><input name=\"read_pin\" type=\"password\" autocomplete=\"new-password\"></label><label>Read+write PIN <span>optional; required only for protected folders</span><input name=\"write_pin\" type=\"password\" autocomplete=\"new-password\"></label><button type=\"submit\">Create folder</button></form><p class=\"error\">If you leave the PIN fields empty, anyone with this folder link and access to the general Splinterparty login can open it.</p><p class=\"muted\">To protect the new folder, enter a recovery passcode and read+write PIN.</p></section></main></body></html>");
     body
 }
 
@@ -3769,10 +3798,10 @@ fn remote_form_html(path: &str, error: Option<&str>) -> String {
 
 fn delete_form_html(path: &str, error: Option<&str>, require_pin: bool) -> String {
     let mut body = String::new();
-    body.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Delete file</title><style>");
+    body.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Delete item</title><style>");
     body.push_str(DIRECTORY_CSS);
     body.push_str(FORM_CSS);
-    body.push_str("</style></head><body><main class=\"form-page\"><section class=\"panel\"><p class=\"eyebrow\">Splinterparty</p><h1>Delete file</h1><p class=\"muted\">");
+    body.push_str("</style></head><body><main class=\"form-page\"><section class=\"panel\"><p class=\"eyebrow\">Splinterparty</p><h1>Delete item</h1><p class=\"muted\">");
     body.push_str(&escape_html(path));
     body.push_str("</p>");
     if let Some(error) = error {
@@ -3792,7 +3821,7 @@ fn delete_form_html(path: &str, error: Option<&str>, require_pin: bool) -> Strin
             "<p class=\"muted\">This file is outside a protected share, so no PIN is required.</p>",
         );
     }
-    body.push_str("<button type=\"submit\">Delete file</button></form><p class=\"muted\">This permanently removes the file from the server directory.</p><p><a class=\"up\" href=\"");
+    body.push_str("<button type=\"submit\">Delete item</button></form><p class=\"muted\">This permanently removes the item from the server directory. Folders are deleted with their contents.</p><p><a class=\"up\" href=\"");
     let parent = path
         .trim_end_matches('/')
         .rsplit_once('/')
@@ -4239,7 +4268,11 @@ fn serve_directory(
             preview_kind(entry.path().as_path()).unwrap_or("")
         });
         body.push_str("\" data-delete=\"");
-        body.push_str(if !is_dir || is_symlink { "1" } else { "0" });
+        body.push_str(if !is_dir || is_symlink || can_write_here {
+            "1"
+        } else {
+            "0"
+        });
         body.push_str("\" data-can-symlink=\"");
         body.push_str(if !is_dir { "1" } else { "0" });
         body.push_str("\" data-can-drag=\"");
@@ -4381,7 +4414,7 @@ fn serve_directory(
     body.push_str(&folder_url_path);
     body.push_str("';const canWrite=");
     body.push_str(if can_write_here { "true" } else { "false" });
-    body.push_str(";const clipKey='splinterparty.clipboard';let clip=loadClip();const open=document.getElementById('ctx-open');const down=document.getElementById('ctx-download');const del=document.getElementById('ctx-delete');const sym=document.getElementById('ctx-symlink');const copy=document.getElementById('ctx-copy');const cut=document.getElementById('ctx-cut');const paste=document.getElementById('ctx-paste');const folder=document.getElementById('ctx-folder');function loadClip(){try{return JSON.parse(sessionStorage.getItem(clipKey)||'null');}catch(_){return null;}}function saveClip(value){clip=value;if(value){sessionStorage.setItem(clipKey,JSON.stringify(value));}else{sessionStorage.removeItem(clipKey);}}function hide(){menu.style.display='none';}function folderTarget(){if(current&&current.dataset.isDir==='1')return current.dataset.path;return currentFolder;}function canClip(row){return canWrite&&row&&row.dataset.canDrag==='1';}async function transfer(endpoint,source,destination){const body=new URLSearchParams({source:source,destination:destination});const resp=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});if(resp.ok||resp.status===204){window.location.reload();return;}alert((await resp.text())||'Could not complete operation.');}document.addEventListener('click',hide);document.addEventListener('keydown',e=>{if(e.key==='Escape')hide();});document.querySelectorAll('.row.item').forEach(row=>{row.addEventListener('contextmenu',e=>{e.preventDefault();clip=loadClip();current=row;const path=row.dataset.path;open.href=path;down.href=path;down.style.display=row.dataset.download==='1'?'block':'none';del.href='/__delete?path='+encodeURIComponent(row.dataset.deletePath||path);del.style.display=row.dataset.delete==='1'?'block':'none';sym.style.display=row.dataset.canSymlink==='1'?'block':'none';copy.style.display=canClip(row)?'block':'none';cut.style.display=canClip(row)?'block':'none';paste.style.display=canWrite&&clip?'block':'none';folder.style.display=canWrite?'block':'none';menu.style.left=Math.min(e.clientX,window.innerWidth-220)+'px';menu.style.top=Math.min(e.clientY,window.innerHeight-270)+'px';menu.style.display='block';});});sym.addEventListener('click',()=>{if(!current)return;hide();const target=current.dataset.path;const defaultName=current.dataset.name||'link';const name=prompt('Symlink name:', defaultName);if(!name)return;const params=new URLSearchParams({path:currentFolder,target_path:target,name:name});window.location.href='/__symlink?'+params.toString();});copy.addEventListener('click',()=>{if(!canClip(current))return;saveClip({path:current.dataset.path,mode:'copy'});hide();});cut.addEventListener('click',()=>{if(!canClip(current))return;saveClip({path:current.dataset.path,mode:'cut'});hide();});paste.addEventListener('click',()=>{clip=loadClip();if(!canWrite||!clip)return;const dest=folderTarget();const endpoint=clip.mode==='cut'?'/__move':'/__copy';const source=clip.path;if(clip.mode==='cut')saveClip(null);hide();transfer(endpoint,source,dest);});folder.addEventListener('click',()=>{hide();window.location.href='/__folder?path='+encodeURIComponent(folderTarget());});window.splinterTransfer=transfer;})();");
+    body.push_str(";const clipKey='splinterparty.clipboard';let clip=loadClip();const open=document.getElementById('ctx-open');const down=document.getElementById('ctx-download');const del=document.getElementById('ctx-delete');const sym=document.getElementById('ctx-symlink');const copy=document.getElementById('ctx-copy');const cut=document.getElementById('ctx-cut');const paste=document.getElementById('ctx-paste');const folder=document.getElementById('ctx-folder');function loadClip(){try{return JSON.parse(sessionStorage.getItem(clipKey)||'null');}catch(_){return null;}}function saveClip(value){clip=value;if(value){sessionStorage.setItem(clipKey,JSON.stringify(value));}else{sessionStorage.removeItem(clipKey);}}function hide(){menu.style.display='none';}function folderTarget(){if(current&&current.dataset.isDir==='1')return current.dataset.path;return currentFolder;}function canClip(row){return canWrite&&row&&row.dataset.canDrag==='1';}async function postTransfer(endpoint,source,destination,destinationPin){const body=new URLSearchParams({source:source,destination:destination});if(destinationPin)body.set('destination_pin',destinationPin);return fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body});}async function transfer(endpoint,source,destination){let resp=await postTransfer(endpoint,source,destination,'');if(resp.status===403){const text=await resp.text();if(text.includes('Destination folder')){const pin=prompt('Read+write PIN for the destination folder:');if(pin===null)return;resp=await postTransfer(endpoint,source,destination,pin);}else{alert(text||'Could not complete operation.');return;}}if(resp.ok||resp.status===204){window.location.reload();return;}alert((await resp.text())||'Could not complete operation.');}document.addEventListener('click',hide);document.addEventListener('keydown',e=>{if(e.key==='Escape')hide();});document.querySelectorAll('.row.item').forEach(row=>{row.addEventListener('contextmenu',e=>{e.preventDefault();clip=loadClip();current=row;const path=row.dataset.path;open.href=path;down.href=path;down.style.display=row.dataset.download==='1'?'block':'none';del.href='/__delete?path='+encodeURIComponent(row.dataset.deletePath||path);del.style.display=row.dataset.delete==='1'?'block':'none';sym.style.display=row.dataset.canSymlink==='1'?'block':'none';copy.style.display=canClip(row)?'block':'none';cut.style.display=canClip(row)?'block':'none';paste.style.display=canWrite&&clip?'block':'none';folder.style.display=canWrite?'block':'none';menu.style.left=Math.min(e.clientX,window.innerWidth-220)+'px';menu.style.top=Math.min(e.clientY,window.innerHeight-270)+'px';menu.style.display='block';});});sym.addEventListener('click',()=>{if(!current)return;hide();const target=current.dataset.path;const defaultName=current.dataset.name||'link';const name=prompt('Symlink name:', defaultName);if(!name)return;const params=new URLSearchParams({path:currentFolder,target_path:target,name:name});window.location.href='/__symlink?'+params.toString();});copy.addEventListener('click',()=>{if(!canClip(current))return;saveClip({path:current.dataset.path,mode:'copy'});hide();});cut.addEventListener('click',()=>{if(!canClip(current))return;saveClip({path:current.dataset.path,mode:'cut'});hide();});paste.addEventListener('click',()=>{clip=loadClip();if(!canWrite||!clip)return;const dest=folderTarget();const endpoint=clip.mode==='cut'?'/__move':'/__copy';const source=clip.path;if(clip.mode==='cut')saveClip(null);hide();transfer(endpoint,source,dest);});folder.addEventListener('click',()=>{hide();window.location.href='/__folder?path='+encodeURIComponent(folderTarget());});window.splinterTransfer=transfer;})();");
     body.push_str("</script>");
     body.push_str("<script>");
     body.push_str("(function(){let dragged=null;document.querySelectorAll('.row.item').forEach(row=>{if(row.dataset.canDrag==='1'){row.addEventListener('dragstart',e=>{dragged=row;row.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',row.dataset.path);});row.addEventListener('dragend',()=>{row.classList.remove('dragging');dragged=null;document.querySelectorAll('.drop-target').forEach(el=>el.classList.remove('drop-target'));});}if(row.dataset.dropTarget==='1'){row.addEventListener('dragover',e=>{if(!dragged||dragged===row)return;e.preventDefault();e.dataTransfer.dropEffect='move';row.classList.add('drop-target');});row.addEventListener('dragleave',()=>row.classList.remove('drop-target'));row.addEventListener('drop',e=>{if(!dragged||dragged===row)return;e.preventDefault();row.classList.remove('drop-target');const source=dragged.dataset.path;const destination=row.dataset.path;if(window.splinterTransfer)window.splinterTransfer('/__move',source,destination);});}});})();");
