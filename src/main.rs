@@ -4585,6 +4585,20 @@ fn serve_directory(
     body.push_str("<script>");
     body.push_str("(function(){let dragged=null;let dragSources=[];document.querySelectorAll('.row.item').forEach(row=>{if(row.dataset.canDrag==='1'){row.addEventListener('dragstart',e=>{dragged=row;dragSources=(window.splinterSelectedSources&&row.classList.contains('selected'))?window.splinterSelectedSources():[row.dataset.path];row.classList.add('dragging');e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',dragSources.join('\\n'));});row.addEventListener('dragend',()=>{row.classList.remove('dragging');dragged=null;dragSources=[];document.querySelectorAll('.drop-target').forEach(el=>el.classList.remove('drop-target'));});}if(row.dataset.dropTarget==='1'){row.addEventListener('dragover',e=>{if(!dragged||dragged===row)return;e.preventDefault();e.dataTransfer.dropEffect='move';row.classList.add('drop-target');});row.addEventListener('dragleave',()=>row.classList.remove('drop-target'));row.addEventListener('drop',e=>{if(!dragged||dragged===row)return;e.preventDefault();row.classList.remove('drop-target');const destination=row.dataset.path;if(window.splinterTransferMany)window.splinterTransferMany('/__move',dragSources,destination);});}});})();");
     body.push_str("</script>");
+    body.push_str("<script>");
+    body.push_str("(function(){");
+    body.push_str("const PART=100*1024*1024;");
+    body.push_str("const folderPath='");
+    body.push_str(&folder_url_path);
+    body.push_str("';");
+    body.push_str("let pasteUploading=false;");
+    body.push_str("async function sha256hex(buf){const digest=await crypto.subtle.digest('SHA-256',buf);return Array.from(new Uint8Array(digest)).map(b=>b.toString(16).padStart(2,'0')).join('');}");
+    body.push_str("async function uploadSmallFile(file){const fd=new FormData();fd.append('path',folderPath);fd.append('file',file,file.name||'pasted-file');const resp=await fetch('/__upload',{method:'POST',body:fd});if(!resp.ok){throw new Error(await resp.text());}}");
+    body.push_str("async function uploadLargeFile(file,index,totalFiles){const totalParts=Math.ceil(file.size/PART);for(let i=0;i<totalParts;i++){const start=i*PART;const slice=file.slice(start,start+PART);const buf=await slice.arrayBuffer();const hash=await sha256hex(buf);showPasteStatus('Uploading '+file.name+' ('+(index+1)+' of '+totalFiles+'), part '+(i+1)+' of '+totalParts+'…');const fd=new FormData();fd.append('path',folderPath);fd.append('filename',file.name||'pasted-file');fd.append('part_index',String(i));fd.append('total_parts',String(totalParts));fd.append('expected_hash',hash);fd.append('data',new Blob([buf]));const resp=await fetch('/__chunk',{method:'POST',body:fd});if(!resp.ok){throw new Error(await resp.text());}}}");
+    body.push_str("function showPasteStatus(text){let box=document.getElementById('paste-upload-status');if(!box){box=document.createElement('div');box.id='paste-upload-status';box.style.position='fixed';box.style.right='16px';box.style.bottom='16px';box.style.zIndex='2000';box.style.padding='12px 14px';box.style.border='1px solid #cbd5e1';box.style.borderRadius='10px';box.style.background='#ffffff';box.style.boxShadow='0 12px 32px rgba(15,23,42,.18)';box.style.fontWeight='700';document.body.appendChild(box);}box.textContent=text;}");
+    body.push_str("document.addEventListener('paste',async function(e){if(pasteUploading)return;if(!e.clipboardData)return;const files=Array.from(e.clipboardData.files||[]);if(files.length===0)return;e.preventDefault();pasteUploading=true;try{for(let i=0;i<files.length;i++){const file=files[i];showPasteStatus('Uploading pasted file '+(i+1)+' of '+files.length+': '+(file.name||'unnamed')+'…');if(file.size>PART){await uploadLargeFile(file,i,files.length);}else{await uploadSmallFile(file);}}showPasteStatus('Paste upload complete — refreshing…');setTimeout(()=>window.location.reload(),700);}catch(err){showPasteStatus('Paste upload failed: '+err.message);pasteUploading=false;}});");
+    body.push_str("})();");
+    body.push_str("</script>");
 
     body.push_str("</section></main></body></html>\n");
 
