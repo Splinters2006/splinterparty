@@ -4,3 +4,9 @@
 /* Keep the record label legible at every size. */
 .record-label{font-size:clamp(10px,2vw,25px)}
 @media(max-width:620px){.record-label{font-size:8px}}
+
+.listener-badge{display:flex;align-items:center;gap:12px;margin-left:auto;padding:12px 20px;background:var(--lime);color:var(--bg);border-radius:8px;min-width:160px}
+.listener-badge>strong{font-size:36px;line-height:1;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:-1px}
+.listener-badge>span{display:flex;flex-direction:column;gap:5px;font-size:14px;font-weight:600}
+.listener-badge small{font-size:8px;letter-spacing:1.4px;font-weight:500}
+@media(max-width:620px){.listener-badge{width:100%;margin-left:0;justify-content:center;padding:14px 20px}.listener-badge>strong{font-size:40px}}

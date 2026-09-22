@@ -22,7 +22,8 @@ async function sync() {
 function render(next) {
   state = next; receivedAt = performance.now();
   $('room-code').textContent = code;
-  $('listeners').textContent = `${state.listeners} listener${state.listeners === 1 ? '' : 's'}`;
+  $('listener-count').textContent = state.listeners;
+  $('listener-label').textContent = state.listeners === 1 ? 'listener' : 'listeners';
   const track = state.tracks.find(item => item.id === state.current);
   $('track-title').textContent = track?.name || 'Room for something good';
   $('track-subtitle').textContent = track ? 'Shared with everyone in this room.' : 'Upload an MP3 or FLAC to start the session.';

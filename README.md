@@ -16,6 +16,26 @@ If port 3000 is already in use, run `PORT=3001 npm start` and open http://localh
 
 `PORT` (default `3000`) and `HOST` (default `0.0.0.0`) configure the listener. For internet hosting, put this single Node process behind an HTTPS reverse proxy. Disable proxy buffering for `/api/rooms/*/events`, allow long-lived SSE connections, and allow request bodies up to 50 MB. No build step is needed.
 
+## Update
+
+For an installation cloned from this repository, run:
+
+```sh
+./update.sh
+```
+
+The script works from any directory, fetches `main` from `origin`, and applies only fast-forward updates. It stops if you have local changes, untracked files, a different branch, or local commits that are not on the remote. It never resets or overwrites your work. Git and Bash are required; there are no dependencies to install or build steps.
+
+After updating, restart the server using your usual command (for example, `PORT=3001 npm start` after stopping the old process). The script does not stop or restart processes. Restarting clears active rooms and uploads.
+
+If your existing checkout predates the script, run `git pull --ff-only origin main` once to get it. For a fresh installation:
+
+```sh
+git clone https://github.com/Splinters2006/splinterparty.git
+cd splinterparty
+npm start
+```
+
 ## Behavior and limits
 
 - The server owns the playback timeline; server-sent events broadcast changes, and clients correct drift. Synchronization is approximate, with network latency and browser buffering affecting alignment.
