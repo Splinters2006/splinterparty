@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="theme-color" content="#101311"><title>splinterparty — listen together</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body>
+  <header><a href="/" class="brand"><span class="logo">s.</span> splinterparty</a><span class="tagline">Good music. Same moment.</span></header>
+  <main>
+    <section id="lobby">
+      <div class="eyebrow"><span class="dot"></span> A LITTLE SPACE FOR YOUR SOUND</div>
+      <h1>Your music.<br>Your people.<br><em>One room.</em></h1>
+      <p class="intro">Drop in your MP3s or FLACs, share a code, and listen together.<br>No accounts. Just press play.</p>
+      <div class="entry"><button id="create" class="primary">Create a room <span>↗</span></button><span class="or">or join your friends</span><form id="join-form"><label for="code">SIX-DIGIT ROOM CODE</label><div class="join-input"><input id="code" placeholder="A1B2C3" maxlength="6" pattern="[A-Fa-f0-9]{6}" autocomplete="off" spellcheck="false" required aria-label="Six-digit hexadecimal room code"><button type="submit" aria-label="Join room">→</button></div></form></div>
+      <div class="record-art" aria-hidden="true"><div class="record"><div class="record-label">SPLINTER<br><b>PARTY</b><span>33⅓ RPM · TOGETHER</span></div></div><span class="art-caption">SIDE A / BETTER TOGETHER</span></div>
+      <div class="steps"><span><b>01</b> Make a room</span><span><b>02</b> Bring your tracks</span><span><b>03</b> Share the moment</span></div>
+    </section>
+    <section id="room" hidden>
+      <div class="room-top"><div><div class="eyebrow">YOUR SHARED LISTENING SPACE</div><h1>In good company<span class="accent">.</span></h1></div><button id="leave" class="quiet">Leave room ↗</button></div>
+      <div class="room-meta"><button id="share" class="code-pill" title="Copy invitation link"><span>ROOM</span> <strong id="room-code"></strong> <span>↗ COPY LINK</span></button><span id="connection"><span class="dot"></span> Connecting…</span><span id="listeners">1 listener</span></div>
+      <div class="room-grid"><div class="player"><div class="mini-record" aria-hidden="true"><span>s.</span></div><div class="eyebrow">NOW PLAYING</div><h2 id="track-title">Room for something good</h2><p id="track-subtitle">Upload an MP3 or FLAC to start the session.</p><button id="enable" class="primary">Enable audio on this device</button><div class="timeline"><input type="range" id="seek" min="0" max="100" value="0" step="0.1" aria-label="Playback position" disabled><div><span id="elapsed">0:00</span><span id="duration">0:00</span></div></div><div class="controls"><button id="play" class="play-button" disabled aria-label="Play">▶</button><button id="next" class="quiet" disabled>Next track →</button></div><label class="volume">VOLUME <input id="volume" type="range" min="0" max="1" step="0.01" value="0.8"></label><p class="hint">Playback controls are shared. Volume is just yours.</p></div>
+      <div class="queue-panel"><div class="queue-heading"><h2>The queue <span id="track-count">0</span></h2><span>EVERYONE'S A DJ</span></div><label id="dropzone" class="dropzone" for="files"><span class="upload-icon">↑</span><strong>Bring your own sound</strong><span>Drop MP3s or FLACs here or <u>browse files</u></span><small>Up to 50 MB per track · 50 tracks per room</small><input id="files" type="file" accept=".mp3,.flac,audio/mpeg,audio/flac,audio/x-flac" multiple></label><p id="upload-status" role="status"></p><ol id="queue"></ol><div id="empty-queue"><span>♫</span><p>A great session starts with one track.</p></div></div></div>
+    </section>
+    <p id="notice" role="status" hidden></p>
+  </main>
+  <footer><span>A shared soundtrack, wherever you are.</span><span>MUSIC IN. GOOD TIMES OUT.</span></footer>
+  <audio id="audio" preload="auto"></audio>
+</body></html>
