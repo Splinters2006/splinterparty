@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Spotify privacy — splinterparty</title><link rel="stylesheet" href="/style.css"></head>
+<body><header><a class="brand" href="/">splinterparty</a></header><main class="privacy-page">
+<h1>Spotify &amp; your privacy</h1>
+<p>Linking Spotify is optional. You can upload and listen to MP3 and FLAC files without a Spotify account.</p>
+<h2>What linking allows</h2>
+<p>We request permission to connect the Spotify browser player, read your account profile and playback state, search tracks, and control playback on your Spotify account. Spotify's browser player requires the email and private profile scopes; this app does not store your email. Each listener streams directly from Spotify through their own Premium account. Spotify audio is never downloaded or relayed by this server.</p>
+<h2>What this server stores</h2>
+<p>Your display name, access token, refresh token, and login session are kept in server memory for up to 24 hours, or until you unlink or the server restarts. A necessary HttpOnly cookie identifies your session. The browser player receives your short-lived access token; refresh tokens stay on the server. Tokens and your profile are not shared with room members.</p>
+<p>Tracks you add share their title, artist, artwork, Spotify link, and duration with everyone who has the room code. That public track metadata remains in the room after you unlink and expires with the room. The server does not attach your account identity to tracks. Search queries are sent to Spotify and are not retained by this app.</p>
+<h2>Disconnect or revoke access</h2>
+<p>Choose <strong>Unlink</strong> in the room's Spotify panel to stop the browser player and delete the server-side session, profile, and tokens. To revoke the app's authorization at Spotify as well, visit <a href="https://www.spotify.com/account/apps/" rel="noopener noreferrer" target="_blank">your Spotify account's Apps page</a> and remove splinterparty.</p>
+<h2>Third parties and hosting</h2>
+<p>When linked, this app loads Spotify's player and sends playback requests to Spotify. Spotify artwork is loaded when Spotify tracks appear. These connections expose your IP address to Spotify and are covered by <a href="https://www.spotify.com/legal/privacy-policy/" rel="noopener noreferrer" target="_blank">Spotify's privacy policy</a>. Your server operator and reverse proxy may keep their own access logs. Contact the person hosting your splinterparty instance for questions about their hosting or logs.</p>
+<p><a href="/">Back to splinterparty</a></p>
+</main></body></html>

@@ -10,3 +10,17 @@
 .listener-badge>span{display:flex;flex-direction:column;gap:5px;font-size:14px;font-weight:600}
 .listener-badge small{font-size:8px;letter-spacing:1.4px;font-weight:500}
 @media(max-width:620px){.listener-badge{width:100%;margin-left:0;justify-content:center;padding:14px 20px}.listener-badge>strong{font-size:40px}}
+.spotify-panel{border:1px solid var(--border);background:var(--panel);border-radius:10px;padding:22px;margin-bottom:30px}
+.spotify-heading{display:flex;align-items:center;justify-content:space-between;gap:18px;flex-wrap:wrap}
+.spotify-heading h2{margin:0;font-size:20px}.spotify-heading h2 span{color:var(--lime);font-size:8px;letter-spacing:1.5px;margin-left:8px}
+.spotify-heading p,.spotify-note,#spotify-search-status{font-size:12px;color:var(--muted);line-height:1.6}
+.spotify-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.spotify-actions .primary{padding:12px 16px;font-size:12px}
+.spotify-panel a,.spotify-art{color:var(--lime)}.spotify-note{margin-bottom:0}.spotify-note a{white-space:nowrap}
+#spotify-search{margin-top:18px}#spotify-search label{font-size:9px;letter-spacing:1.5px;color:var(--muted)}
+.spotify-search-row{display:flex;gap:10px;margin-top:9px}.spotify-search-row input{min-width:0;flex:1;border:1px solid var(--border);background:var(--bg);border-radius:5px;color:var(--text);padding:12px;font-size:13px}
+#spotify-results{list-style:none;padding:0;margin:0;max-height:350px;overflow:auto}#spotify-results li{display:flex;align-items:center;gap:12px;padding:12px 0;border-top:1px solid var(--border)}
+#spotify-results img{width:48px;height:48px;object-fit:contain}#spotify-results a{flex:1;font-size:13px;line-height:1.5;text-decoration:none;overflow-wrap:anywhere}#spotify-results a:hover{text-decoration:underline}#spotify-results button{padding:10px 12px;font-size:12px;white-space:nowrap}
+.spotify-art{display:flex;flex-direction:column;gap:12px;align-items:center;font-size:11px;text-decoration:none;margin:4px auto 25px}.spotify-art img{width:180px;height:180px;object-fit:contain}
+.queue-spotify-link{display:block;color:var(--lime);font-size:10px;margin:0 10px 12px 43px;text-decoration:none}.queue-spotify-link:hover{text-decoration:underline}
+.privacy-page{max-width:760px;line-height:1.8}.privacy-page h1{font-size:44px;letter-spacing:-2px}.privacy-page h2{font-size:20px}.privacy-page p,.privacy-page li{color:var(--muted)}.privacy-page a{color:var(--lime)}
+@media(max-width:620px){.spotify-panel{padding:18px}.spotify-search-row .primary{padding:12px}.spotify-actions{width:100%}}
